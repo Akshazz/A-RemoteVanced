@@ -1,0 +1,7 @@
+# Runtime SQLite sidecar files
+/data/*.sqlite-shm
+/data/*.sqlite-wal
+/data/*.sqlite-journal
+
+# Keep the packaged database; ignore local backups
+/data/*.bak
