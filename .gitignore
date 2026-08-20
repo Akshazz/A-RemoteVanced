@@ -5,3 +5,12 @@
 
 # Keep the packaged database; ignore local backups
 /data/*.bak
+
+# Control agent runtime state (created when "Run server" starts the agent)
+/agent/.token
+/agent/agent-run.log
+/agent/agent-run.pid
+/agent/node_modules
+
+# Network sidebar access code (generated on first use if not set via env)
+/data/network-sidebar.token

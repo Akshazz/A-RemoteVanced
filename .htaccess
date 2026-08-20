@@ -1,6 +1,13 @@
 DirectoryIndex index.php
 Options -Indexes
 
+# Never serve local secret files (agent token, network sidebar access code)
+# over HTTP, however this project is deployed.
+<FilesMatch "\.(token)$">
+    Require all denied
+</FilesMatch>
+RedirectMatch 404 ^/data/
+
 RewriteEngine On
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d

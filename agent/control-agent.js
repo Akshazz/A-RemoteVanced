@@ -13,7 +13,8 @@
  * Python, no node-gyp required.
  *
  * Security model:
- *   - Binds to 127.0.0.1 only (never exposed to the network).
+ *   - Binds to 127.0.0.1 by default. LAN binding is opt-in through
+ *     RB_AGENT_HOST=0.0.0.0 and still requires the random token.
  *   - Requires a random token (printed on first run, saved to .token)
  *     that the host must paste into the RemoteBridge page before the
  *     browser tab is allowed to send it commands. This stops any other
@@ -40,7 +41,8 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
 
-const PORT = 8791;
+const HOST = process.env.RB_AGENT_HOST || '127.0.0.1';
+const PORT = Number(process.env.RB_AGENT_PORT || 8791);
 const TOKEN_FILE = path.join(__dirname, '.token');
 const PS_SCRIPT = path.join(__dirname, 'win-input.ps1');
 
@@ -54,6 +56,7 @@ function loadOrCreateToken() {
 }
 
 const TOKEN = loadOrCreateToken();
+let authenticatedClients = 0;
 
 /* ------------------------- Input backend ------------------------- */
 
@@ -91,8 +94,10 @@ startInputBackend();
 
 /* ---------------------------- Server ---------------------------- */
 
-const wss = new WebSocketServer({ host: '127.0.0.1', port: PORT });
-console.log(`RemoteBridge control agent listening on ws://127.0.0.1:${PORT}`);
+const wss = new WebSocketServer({ host: HOST, port: PORT });
+const displayHost = HOST === '0.0.0.0' ? '<server-LAN-IP>' : HOST;
+console.log(`RemoteBridge control agent listening on ws://${displayHost}:${PORT}`);
+console.log(`Agent bind address: ${HOST}:${PORT}`);
 console.log(`Token (paste this into the RemoteBridge Host tab): ${TOKEN}`);
 console.log('Press Ctrl+C to stop and revoke control at any time.\n');
 
@@ -106,7 +111,8 @@ wss.on('connection', (ws) => {
       if (msg.type === 'auth' && msg.token === TOKEN) {
         authed = true;
         ws.send(JSON.stringify({ type: 'auth_ok' }));
-        console.log('Browser tab authenticated.');
+        authenticatedClients += 1;
+        console.log(`Control client authenticated (active: ${authenticatedClients}).`);
       } else {
         ws.send(JSON.stringify({ type: 'auth_fail' }));
         ws.close();
@@ -115,7 +121,12 @@ wss.on('connection', (ws) => {
     }
     applyCommand(msg);
   });
-  ws.on('close', () => { if (authed) console.log('Browser tab disconnected.'); });
+  ws.on('close', () => {
+    if (authed) {
+      authenticatedClients = Math.max(0, authenticatedClients - 1);
+      console.log(`Control client disconnected (active: ${authenticatedClients}).`);
+    }
+  });
 });
 
 process.on('SIGINT', () => {

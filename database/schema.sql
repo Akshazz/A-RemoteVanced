@@ -1,11 +1,11 @@
 -- RemoteBridge Native PHP / MySQL-MariaDB Database Schema
 -- Compatible with MySQL 8+ and MariaDB 10.6+
 
-CREATE DATABASE IF NOT EXISTS `remote_bridge`
+CREATE DATABASE IF NOT EXISTS `a_remote`
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 
-USE `remote_bridge`;
+USE `a_remote`;
 
 CREATE TABLE IF NOT EXISTS `migrations` (
   `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -13,6 +13,14 @@ CREATE TABLE IF NOT EXISTS `migrations` (
   `applied_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_migrations_version` (`version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+CREATE TABLE IF NOT EXISTS `app_settings` (
+  `setting_key` VARCHAR(100) NOT NULL,
+  `setting_value` TEXT NULL,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`setting_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `devices` (
@@ -23,6 +31,7 @@ CREATE TABLE IF NOT EXISTS `devices` (
   `agent_token_hash` CHAR(64) NULL,
   `ip_address` VARCHAR(45) NULL,
   `last_seen_at` DATETIME NULL,
+  `is_online` TINYINT(1) NOT NULL DEFAULT 0,
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
