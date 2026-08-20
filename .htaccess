@@ -1,5 +1,6 @@
 DirectoryIndex index.php
 Options -Indexes
+AcceptPathInfo On
 
 # Never serve local secret files (agent token, network sidebar access code)
 # over HTTP, however this project is deployed.

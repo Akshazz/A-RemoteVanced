@@ -17,6 +17,13 @@ $path = $requestPath;
 if ($basePath !== '' && str_starts_with($path, $basePath)) {
     $path = substr($path, strlen($basePath)) ?: '/';
 }
+// Support both Apache rewrite URLs (/api/...) and the no-rewrite fallback
+// (/index.php/api/...). The latter is important on XAMPP installations where
+// AllowOverride/RewriteEngine may be disabled.
+if (str_starts_with($path, '/index.php')) {
+    $path = substr($path, strlen('/index.php')) ?: '/';
+}
+if ($path === '') $path = '/';
 if ($path[0] !== '/') $path = '/' . $path;
 
 /* ---------------------------------------------------------------------
@@ -1278,7 +1285,9 @@ Click "Run server" to start — output streams here.
 </div>
 <script>
 const RB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
-function rbUrl(p){ return RB_BASE + p; }
+// Always use the explicit index.php front-controller path for API requests.
+// This works even when Apache mod_rewrite / AllowOverride is disabled.
+function rbUrl(p){ return RB_BASE + '/index.php' + p; }
 async function checkHealth(){
   const s=document.getElementById('status');
   try{const r=await fetch(rbUrl('/health'),{cache:'no-store'});const j=await r.json();

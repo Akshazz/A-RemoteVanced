@@ -81,7 +81,7 @@ CREATE TABLE `devices` (
 --
 
 INSERT INTO `devices` (`id`, `user_id`, `remote_id`, `device_name`, `mac_fingerprint`, `agent_token_hash`, `ip_address`, `last_seen_at`, `is_online`, `created_at`, `updated_at`) VALUES
-(1, 1, '959717370', 'Win32', NULL, NULL, '::1', '2026-08-20 15:21:25', 1, '2026-08-20 06:45:51', '2026-08-20 07:21:25'),
+(1, 1, '959717370', 'Win32', NULL, NULL, '::1', '2026-08-20 15:21:35', 1, '2026-08-20 06:45:51', '2026-08-20 07:21:35'),
 (48, 2, '335763731', 'Win32', NULL, NULL, '192.168.0.84', NULL, 0, '2026-08-20 07:07:42', '2026-08-20 07:07:42');
 
 -- --------------------------------------------------------
