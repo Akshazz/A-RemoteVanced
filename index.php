@@ -3,7 +3,19 @@ declare(strict_types=1);
 
 // Needed so the "Devices on this network" access-control gate can remember
 // that a browser tab unlocked it, across the polling requests it makes.
-session_start();
+// Keep the session cookie inaccessible to JavaScript and scoped to same-site
+// requests. Secure is enabled automatically when HTTPS is used.
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    $https = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
+        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
+    session_set_cookie_params([
+        'httponly' => true,
+        'secure' => $https,
+        'samesite' => 'Lax',
+        'path' => '/',
+    ]);
+    session_start();
+}
 
 require __DIR__ . '/database.php';
 $config = require __DIR__ . '/config.php';
@@ -17,13 +29,6 @@ $path = $requestPath;
 if ($basePath !== '' && str_starts_with($path, $basePath)) {
     $path = substr($path, strlen($basePath)) ?: '/';
 }
-// Support both Apache rewrite URLs (/api/...) and the no-rewrite fallback
-// (/index.php/api/...). The latter is important on XAMPP installations where
-// AllowOverride/RewriteEngine may be disabled.
-if (str_starts_with($path, '/index.php')) {
-    $path = substr($path, strlen('/index.php')) ?: '/';
-}
-if ($path === '') $path = '/';
 if ($path[0] !== '/') $path = '/' . $path;
 
 /* ---------------------------------------------------------------------
@@ -687,6 +692,9 @@ if ($path === '/api/network/unlock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($submitted === '' || !hash_equals($expected, $submitted)) {
         rb_json(['ok' => false, 'error' => 'Incorrect code'], 403);
     }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_regenerate_id(true);
+    }
     $_SESSION['network_unlocked'] = true;
     rb_json(['ok' => true]);
 }
@@ -1112,7 +1120,7 @@ main{max-width:900px;margin:0 auto;width:100%}
       <div id="setupPanelAdvanced" class="hidden">
         <ol class="guide-steps">
           <li><strong>Configure the database.</strong> All PHP database connections use the central <code>config.php</code> file. For a normal XAMPP setup, edit only the <code>database</code> block there: <code>host</code>, <code>port</code>, <code>database</code>, <code>username</code>, and <code>password</code>. You do not need to edit <code>index.php</code>, <code>database.php</code>, or the migration runner for connection changes.</li>
-          <li><strong>Run the migrations.</strong> From the project root: <code>php database/migrate.php</code> — this creates the MySQL/MariaDB database and applies the schema. A ready-made SQL dump is also available at <code>database/schema.sql</code>.</li>
+          <li><strong>Run the migrations.</strong> From the project root: <code>php database/migrate.php</code> — this creates the MySQL/MariaDB database and applies the schema. A ready-made SQL dump is also available at <code>database/remote_bridge.sql</code>.</li>
           <li><strong>Start the server.</strong> <code>php -S 0.0.0.0:8080 index.php</code>, then open <code>http://127.0.0.1:8080/</code>. Running under XAMPP/Apache in a subfolder works too — the frontend detects the install path automatically.</li>
           <li><strong>Set up TURN for internet use (optional).</strong> A free shared TURN relay (Open Relay Project) is used automatically with zero setup. For production or heavy use, set <code>RB_TURN_URL</code>, <code>RB_TURN_USERNAME</code>, and <code>RB_TURN_CREDENTIAL</code> in <code>config.php</code>, or set <code>RB_DISABLE_FREE_TURN=1</code> to turn the free fallback off.</li>
           <li><strong>Enable remote control (optional).</strong> On the host side, under the "Share my screen" tab → "Native control agent", click <strong>Run server</strong> (or run <code>cd agent && npm install && node control-agent.js</code> yourself), paste the token it prints, and click Connect. Only do this for someone you trust — once granted, control stays active until you uncheck it.</li>
@@ -1183,6 +1191,10 @@ main{max-width:900px;margin:0 auto;width:100%}
       <label class="row" style="margin-top:12px;cursor:pointer">
         <input type="checkbox" id="allowControl"> Allow the connected viewer to control this mouse &amp; keyboard
       </label>
+      <label class="row" style="margin-top:8px;cursor:pointer">
+        <input type="checkbox" id="allowConsole" disabled> Allow the connected viewer to open a <strong>remote console</strong> (advanced — runs real commands on this computer)
+      </label>
+      <p id="consoleAvailabilityHint" class="muted" style="font-size:12.5px;margin:4px 0 0 26px">Connect the native control agent above to enable this.</p>
       <div class="row" style="margin-top:10px"><button class="danger" onclick="rbStopHosting()">Stop sharing</button></div>
     </div>
 
@@ -1220,6 +1232,14 @@ Click "Run server" to start — output streams here.
       <div id="agentDiagnostics" class="connection-diagnostics" aria-live="polite">
         <span>PHP signaling: checking…</span><span>Agent endpoint: checking…</span>
       </div>
+
+      <div class="term-wrap" style="margin-top:14px">
+        <div class="term-bar">
+          <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span> remote console (read-only mirror of what the viewer runs)</span>
+          <button class="secondary" onclick="document.getElementById('hostConsoleLog').textContent=''">Clear</button>
+        </div>
+        <pre id="hostConsoleLog" class="term" aria-live="polite">Nothing yet. This fills in only while "Allow remote console" is checked above and the viewer opens one.</pre>
+      </div>
     </div>
   </section>
 
@@ -1238,6 +1258,27 @@ Click "Run server" to start — output streams here.
     <div id="viewerVideoWrap" class="hidden" style="margin-top:16px">
       <video id="viewerVideo" autoplay playsinline></video>
       <div class="row" style="margin-top:10px"><button class="danger" onclick="rbDisconnect()">Disconnect</button></div>
+
+      <div class="card" style="margin-top:18px;padding:18px">
+        <h2 style="font-size:16px">Remote console</h2>
+        <p class="muted" style="font-size:12.5px">Only works if the host has checked "Allow the connected viewer to open a remote console" on their side, and started their agent with the console feature enabled. Runs git-bash/bash on the host if available, otherwise the platform default shell.</p>
+        <div class="row" style="margin-top:8px">
+          <button id="btnConsoleStart" class="secondary" disabled onclick="rbConsoleStart()">Start console</button>
+          <button id="btnConsoleStop" class="secondary" disabled onclick="rbConsoleStop()">Stop console</button>
+        </div>
+        <div class="term-wrap" style="margin-top:10px">
+          <div class="term-bar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span> remote shell</span>
+            <button class="secondary" onclick="document.getElementById('viewerConsoleLog').textContent=''">Clear</button>
+          </div>
+          <pre id="viewerConsoleLog" class="term" aria-live="polite">Click "Start console" once connected.</pre>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="consoleInput" placeholder="Type a command and press Enter" disabled
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();rbConsoleSendLine();}">
+          <button id="btnConsoleSend" class="secondary" disabled onclick="rbConsoleSendLine()">Send</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -1285,9 +1326,7 @@ Click "Run server" to start — output streams here.
 </div>
 <script>
 const RB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
-// Always use the explicit index.php front-controller path for API requests.
-// This works even when Apache mod_rewrite / AllowOverride is disabled.
-function rbUrl(p){ return RB_BASE + '/index.php' + p; }
+function rbUrl(p){ return RB_BASE + p; }
 async function checkHealth(){
   const s=document.getElementById('status');
   try{const r=await fetch(rbUrl('/health'),{cache:'no-store'});const j=await r.json();
@@ -1302,6 +1341,6 @@ function rbShowTab(which){
   document.getElementById('panelViewer').classList.toggle('hidden', which!=='viewer');
 }
 </script>
-<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260820-remoteid-fix3"></script>
+<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260821-remote-console"></script>
 </body>
 </html>

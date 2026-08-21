@@ -33,12 +33,6 @@ CREATE TABLE `app_settings` (
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
---
--- Dumping data for table `app_settings`
---
-
-INSERT INTO `app_settings` (`setting_key`, `setting_value`, `updated_at`) VALUES
-('network_access_code', '0ac2386d8137e8cb', '2026-08-20 07:19:51');
 
 -- --------------------------------------------------------
 
@@ -76,13 +70,6 @@ CREATE TABLE `devices` (
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
---
--- Dumping data for table `devices`
---
-
-INSERT INTO `devices` (`id`, `user_id`, `remote_id`, `device_name`, `mac_fingerprint`, `agent_token_hash`, `ip_address`, `last_seen_at`, `is_online`, `created_at`, `updated_at`) VALUES
-(1, 1, '959717370', 'Win32', NULL, NULL, '::1', '2026-08-20 15:21:35', 1, '2026-08-20 06:45:51', '2026-08-20 07:21:35'),
-(48, 2, '335763731', 'Win32', NULL, NULL, '192.168.0.84', NULL, 0, '2026-08-20 07:07:42', '2026-08-20 07:07:42');
 
 -- --------------------------------------------------------
 
@@ -96,12 +83,6 @@ CREATE TABLE `migrations` (
   `applied_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
---
--- Dumping data for table `migrations`
---
-
-INSERT INTO `migrations` (`id`, `version`, `applied_at`) VALUES
-(1, '001_initial', '2026-08-20 06:40:42');
 
 -- --------------------------------------------------------
 
