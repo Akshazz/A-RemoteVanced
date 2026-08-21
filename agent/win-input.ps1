@@ -55,13 +55,13 @@ while ($true) {
 
     switch ($cmd.type) {
         'move' {
-            $x = [int]($cmd.x * $screenW)
-            $y = [int]($cmd.y * $screenH)
+            $x = [Math]::Min($screenW - 1, [Math]::Max(0, [int]($cmd.x * $screenW)))
+            $y = [Math]::Min($screenH - 1, [Math]::Max(0, [int]($cmd.y * $screenH)))
             [Win32Input]::SetCursorPos($x, $y)
         }
         'button' {
-            $x = [int]($cmd.x * $screenW)
-            $y = [int]($cmd.y * $screenH)
+            $x = [Math]::Min($screenW - 1, [Math]::Max(0, [int]($cmd.x * $screenW)))
+            $y = [Math]::Min($screenH - 1, [Math]::Max(0, [int]($cmd.y * $screenH)))
             [Win32Input]::SetCursorPos($x, $y)
             $down = ($cmd.action -eq 'down')
             $flag = switch ([int]$cmd.button) {

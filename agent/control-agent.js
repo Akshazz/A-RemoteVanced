@@ -82,9 +82,42 @@ function startInputBackend() {
 }
 
 function applyCommand(cmd) {
-  if (!inputReady || !inputProc || !inputProc.stdin.writable) return;
+  if (!inputReady || !inputProc || !inputProc.stdin.writable || !cmd || typeof cmd !== 'object') return;
+
+  // Only the small input protocol used by the browser is accepted. Do not
+  // forward arbitrary JSON to the PowerShell backend.
+  const type = String(cmd.type || '');
+  if (!['move', 'button', 'wheel', 'key'].includes(type)) return;
+
+  const safe = { type };
+  if (type === 'move' || type === 'button') {
+    const x = Number(cmd.x), y = Number(cmd.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) return;
+    safe.x = x;
+    safe.y = y;
+  }
+  if (type === 'button') {
+    const button = Number(cmd.button);
+    const action = String(cmd.action || '');
+    if (![0, 1, 2].includes(button) || !['down', 'up'].includes(action)) return;
+    safe.button = button;
+    safe.action = action;
+  }
+  if (type === 'wheel') {
+    const deltaY = Number(cmd.deltaY);
+    if (!Number.isFinite(deltaY) || Math.abs(deltaY) > 10000) return;
+    safe.deltaY = deltaY;
+  }
+  if (type === 'key') {
+    const key = String(cmd.key || '');
+    const action = String(cmd.action || '');
+    if (key.length === 0 || key.length > 32 || !['down', 'up'].includes(action)) return;
+    safe.key = key;
+    safe.action = action;
+  }
+
   try {
-    inputProc.stdin.write(JSON.stringify(cmd) + '\n');
+    inputProc.stdin.write(JSON.stringify(safe) + '\n');
   } catch (e) {
     console.error('Failed to send command to input backend:', e.message);
   }
