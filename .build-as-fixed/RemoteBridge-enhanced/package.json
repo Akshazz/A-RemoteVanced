@@ -1,0 +1,14 @@
+{
+  "name": "remote-bridge",
+  "version": "2.1.0",
+  "private": true,
+  "description": "RemoteBridge PHP/MySQL remote support application with an optional local control agent for native mouse/keyboard input and an opt-in remote console (git-bash/bash/cmd).",
+  "workspaces": [
+    "agent"
+  ],
+  "scripts": {
+    "install:agent": "npm install --workspace agent",
+    "start:agent": "npm start --workspace agent",
+    "check:agent": "node --check agent/control-agent.js"
+  }
+}

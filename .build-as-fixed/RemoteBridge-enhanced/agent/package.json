@@ -1,0 +1,12 @@
+{
+  "name": "remotebridge-control-agent",
+  "version": "1.2.0",
+  "description": "Local companion process for RemoteBridge remote control: real mouse/keyboard input injection (Windows, via user32.dll through PowerShell, no native compile required) plus an opt-in remote console/shell (git-bash/bash/cmd, cross-platform). Run only on the machine you intend to let a trusted remote user control.",
+  "main": "control-agent.js",
+  "scripts": {
+    "start": "node control-agent.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
