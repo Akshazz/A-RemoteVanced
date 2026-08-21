@@ -3,7 +3,19 @@ declare(strict_types=1);
 
 // Needed so the "Devices on this network" access-control gate can remember
 // that a browser tab unlocked it, across the polling requests it makes.
-session_start();
+// Keep the session cookie inaccessible to JavaScript and scoped to same-site
+// requests. Secure is enabled automatically when HTTPS is used.
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    $https = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
+        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
+    session_set_cookie_params([
+        'httponly' => true,
+        'secure' => $https,
+        'samesite' => 'Lax',
+        'path' => '/',
+    ]);
+    session_start();
+}
 
 require __DIR__ . '/database.php';
 $config = require __DIR__ . '/config.php';
@@ -17,13 +29,6 @@ $path = $requestPath;
 if ($basePath !== '' && str_starts_with($path, $basePath)) {
     $path = substr($path, strlen($basePath)) ?: '/';
 }
-// Support both Apache rewrite URLs (/api/...) and the no-rewrite fallback
-// (/index.php/api/...). The latter is important on XAMPP installations where
-// AllowOverride/RewriteEngine may be disabled.
-if (str_starts_with($path, '/index.php')) {
-    $path = substr($path, strlen('/index.php')) ?: '/';
-}
-if ($path === '') $path = '/';
 if ($path[0] !== '/') $path = '/' . $path;
 
 /* ---------------------------------------------------------------------
@@ -687,6 +692,9 @@ if ($path === '/api/network/unlock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($submitted === '' || !hash_equals($expected, $submitted)) {
         rb_json(['ok' => false, 'error' => 'Incorrect code'], 403);
     }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_regenerate_id(true);
+    }
     $_SESSION['network_unlocked'] = true;
     rb_json(['ok' => true]);
 }
@@ -1112,7 +1120,7 @@ main{max-width:900px;margin:0 auto;width:100%}
       <div id="setupPanelAdvanced" class="hidden">
         <ol class="guide-steps">
           <li><strong>Configure the database.</strong> All PHP database connections use the central <code>config.php</code> file. For a normal XAMPP setup, edit only the <code>database</code> block there: <code>host</code>, <code>port</code>, <code>database</code>, <code>username</code>, and <code>password</code>. You do not need to edit <code>index.php</code>, <code>database.php</code>, or the migration runner for connection changes.</li>
-          <li><strong>Run the migrations.</strong> From the project root: <code>php database/migrate.php</code> — this creates the MySQL/MariaDB database and applies the schema. A ready-made SQL dump is also available at <code>database/schema.sql</code>.</li>
+          <li><strong>Run the migrations.</strong> From the project root: <code>php database/migrate.php</code> — this creates the MySQL/MariaDB database and applies the schema. A ready-made SQL dump is also available at <code>database/remote_bridge.sql</code>.</li>
           <li><strong>Start the server.</strong> <code>php -S 0.0.0.0:8080 index.php</code>, then open <code>http://127.0.0.1:8080/</code>. Running under XAMPP/Apache in a subfolder works too — the frontend detects the install path automatically.</li>
           <li><strong>Set up TURN for internet use (optional).</strong> A free shared TURN relay (Open Relay Project) is used automatically with zero setup. For production or heavy use, set <code>RB_TURN_URL</code>, <code>RB_TURN_USERNAME</code>, and <code>RB_TURN_CREDENTIAL</code> in <code>config.php</code>, or set <code>RB_DISABLE_FREE_TURN=1</code> to turn the free fallback off.</li>
           <li><strong>Enable remote control (optional).</strong> On the host side, under the "Share my screen" tab → "Native control agent", click <strong>Run server</strong> (or run <code>cd agent && npm install && node control-agent.js</code> yourself), paste the token it prints, and click Connect. Only do this for someone you trust — once granted, control stays active until you uncheck it.</li>
@@ -1285,9 +1293,7 @@ Click "Run server" to start — output streams here.
 </div>
 <script>
 const RB_BASE = <?= json_encode($basePath, JSON_UNESCAPED_SLASHES) ?>;
-// Always use the explicit index.php front-controller path for API requests.
-// This works even when Apache mod_rewrite / AllowOverride is disabled.
-function rbUrl(p){ return RB_BASE + '/index.php' + p; }
+function rbUrl(p){ return RB_BASE + p; }
 async function checkHealth(){
   const s=document.getElementById('status');
   try{const r=await fetch(rbUrl('/health'),{cache:'no-store'});const j=await r.json();
