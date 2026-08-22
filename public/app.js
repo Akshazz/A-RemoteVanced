@@ -186,22 +186,36 @@ async function rbLoadDevices() {
   }
 }
 
-let rbNetworkScanTimer = null;
+// Tracks the in-flight scan request so the "Force stop" button can cancel it
+// client-side (AbortController) and tell the server to stop early too.
+let rbScanAbortController = null;
+
+function rbSetScanningUI(scanning) {
+  const btn = document.getElementById('btnScanDevices');
+  const stopBtn = document.getElementById('btnStopScan');
+  if (btn) {
+    btn.disabled = scanning;
+    btn.dataset.scanning = scanning ? '1' : '0';
+    btn.textContent = scanning ? 'Scanning…' : 'Scan network';
+  }
+  if (stopBtn) stopBtn.classList.toggle('hidden', !scanning);
+}
 
 async function rbScanDevices() {
   const btn = document.getElementById('btnScanDevices');
   const grid = document.getElementById('deviceGrid');
   if (!btn || btn.dataset.scanning === '1') return;
 
-  btn.dataset.scanning = '1';
-  btn.disabled = true;
-  btn.textContent = 'Scanning…';
-  if (grid) grid.innerHTML = '<div class="device-empty">Scanning the local network…</div>';
+  // A fresh controller per scan. Aborting it both cancels the browser's wait
+  // immediately and (via the request closing) lets the server detect the
+  // disconnect and stop the scan process early instead of running to its
+  // full timeout in the background.
+  rbScanAbortController = new AbortController();
+  rbSetScanningUI(true);
+  if (grid) grid.innerHTML = '<div class="device-empty">Scanning the local network… <button type="button" class="link-btn" onclick="rbStopScan()">Force stop</button></div>';
 
   try {
-    // The server owns the scan and enforces a hard timeout. There is no
-    // browser polling loop and, importantly, no detached/background scanner.
-    const result = await rbApi('/api/network/scan', { method: 'POST' });
+    const result = await rbApi('/api/network/scan', { method: 'POST', signal: rbScanAbortController.signal });
     const devices = result.devices || [];
     const countEl = document.getElementById('deviceCount');
     if (countEl) countEl.textContent = devices.length
@@ -219,17 +233,24 @@ async function rbScanDevices() {
     }
     await rbLoadLocalUsers();
   } catch (e) {
-    if (e.message === 'locked') rbShowDeviceLockState(false);
-    else if (grid) grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
-  } finally {
-    btn.disabled = false;
-    btn.dataset.scanning = '0';
-    btn.textContent = 'Scan network';
-    if (rbNetworkScanTimer) {
-      clearInterval(rbNetworkScanTimer);
-      rbNetworkScanTimer = null;
+    if (e.name === 'AbortError') {
+      if (grid) grid.innerHTML = '<div class="device-empty">Scan stopped. Showing the last known devices from the ARP cache.</div>';
+      // Best-effort refresh from whatever the ARP cache already has, since
+      // the in-progress scan was cut short before it could return results.
+      rbLoadDevices();
+    } else if (e.message === 'locked') {
+      rbShowDeviceLockState(false);
+    } else if (grid) {
+      grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
     }
+  } finally {
+    rbSetScanningUI(false);
+    rbScanAbortController = null;
   }
+}
+
+function rbStopScan() {
+  if (rbScanAbortController) rbScanAbortController.abort();
 }
 
 let localUsersPollTimer = null;
@@ -721,30 +742,72 @@ function rbAgentConsoleAppend(text) {
   rbExtractAgentToken();
 }
 
+function rbSetAgentServerUI(running, pid = null, message = null) {
+  const stateEl = document.getElementById('agentServerState');
+  const badge = document.getElementById('agentServerBadge');
+  const runBtn = document.getElementById('btnRunServer');
+  const stopBtn = document.getElementById('btnStopServer');
+  if (!stateEl || !runBtn || !stopBtn) return;
+
+  if (running) {
+    stateEl.textContent = pid ? `Running (PID ${pid})` : 'Running';
+    if (badge) {
+      badge.textContent = 'RUNNING';
+      badge.className = 'badge local';
+    }
+    runBtn.classList.add('hidden');
+    runBtn.disabled = false;
+    stopBtn.classList.remove('hidden');
+  } else {
+    stateEl.textContent = message || 'Stopped';
+    if (badge) {
+      badge.textContent = 'STOPPED';
+      badge.className = 'badge warn';
+    }
+    runBtn.classList.remove('hidden');
+    runBtn.disabled = false;
+    stopBtn.classList.add('hidden');
+  }
+}
+
+async function rbLoadAgentServerStatus() {
+  try {
+    const data = await rbApi('/api/agent/status', { method: 'GET' });
+    rbSetAgentServerUI(!!data.running, data.pid);
+    if (data.running) {
+      clearInterval(agentServerPollTimer);
+      agentServerPollTimer = setInterval(rbPollAgentServerOutput, 1000);
+      rbPollAgentServerOutput();
+    } else {
+      clearInterval(agentServerPollTimer);
+    }
+    return data;
+  } catch (e) {
+    rbSetAgentServerUI(false, null, 'Unavailable');
+    return null;
+  }
+}
+
 async function rbStartAgentServer() {
   const btnRun = document.getElementById('btnRunServer');
-  const btnStop = document.getElementById('btnStopServer');
-  const stateEl = document.getElementById('agentServerState');
   const consoleEl = document.getElementById('agentConsole');
-  consoleEl.textContent = '';
+  if (consoleEl) consoleEl.textContent = '';
   agentServerOffset = 0;
   btnRun.disabled = true;
-  stateEl.textContent = 'Starting…';
+  rbSetAgentServerUI(false, null, 'Starting…');
+
   try {
     const data = await rbApi('/api/agent/start', { method: 'POST' });
     if (data.already_running) {
-      rbAgentConsoleAppend('(agent process was already running, pid ' + data.pid + ')\n');
+      rbAgentConsoleAppend('(agent process was already running, PID ' + data.pid + ')\n');
     }
-    stateEl.textContent = 'Running (pid ' + data.pid + ')';
-    btnRun.classList.add('hidden');
-    btnStop.classList.remove('hidden');
+    rbSetAgentServerUI(true, data.pid);
     rbLog('Started local control agent process.');
     clearInterval(agentServerPollTimer);
     agentServerPollTimer = setInterval(rbPollAgentServerOutput, 1000);
     rbPollAgentServerOutput();
   } catch (e) {
-    stateEl.textContent = 'Failed to start: ' + e.message;
-    btnRun.disabled = false;
+    rbSetAgentServerUI(false, null, 'Failed to start: ' + e.message);
   }
 }
 
@@ -753,31 +816,76 @@ async function rbPollAgentServerOutput() {
     const data = await rbApi(`/api/agent/output?offset=${agentServerOffset}`, { method: 'GET' });
     agentServerOffset = data.offset;
     rbAgentConsoleAppend(data.chunk);
-    const stateEl = document.getElementById('agentServerState');
     if (!data.running) {
       clearInterval(agentServerPollTimer);
-      stateEl.textContent = 'Stopped';
-      document.getElementById('btnRunServer').classList.remove('hidden');
-      document.getElementById('btnRunServer').disabled = false;
-      document.getElementById('btnStopServer').classList.add('hidden');
+      rbSetAgentServerUI(false, null, 'Stopped');
+      if (agentConnected && agentSocket) {
+        try { agentSocket.close(); } catch (_) {}
+      }
+    } else {
+      const status = await rbApi('/api/agent/status', { method: 'GET' }).catch(() => null);
+      if (status?.running) rbSetAgentServerUI(true, status.pid);
     }
   } catch (_) { /* transient network errors: ignore */ }
 }
 
-async function rbStopAgentServer() {
+function rbOpenAgentStopModal() {
+  const modal = document.getElementById('agentStopModal');
+  const state = document.getElementById('agentStopModalState');
+  if (!modal) return;
+  if (state) state.textContent = 'The agent is currently running. Stopping it will revoke all active remote control sessions.';
+  modal.classList.remove('hidden');
+  document.getElementById('btnConfirmStopAgent')?.focus();
+}
+
+function rbCloseAgentStopModal() {
+  document.getElementById('agentStopModal')?.classList.add('hidden');
+}
+
+async function rbConfirmStopAgent() {
+  const confirmBtn = document.getElementById('btnConfirmStopAgent');
+  const state = document.getElementById('agentStopModalState');
+  if (confirmBtn) confirmBtn.disabled = true;
+  if (state) state.textContent = 'Stopping agent safely…';
+
   try {
-    await rbApi('/api/agent/stop', { method: 'POST' });
-  } catch (_) {}
-  clearInterval(agentServerPollTimer);
-  rbAgentConsoleAppend('\n=== stopped ===\n');
-  document.getElementById('agentServerState').textContent = 'Stopped';
-  document.getElementById('btnRunServer').classList.remove('hidden');
-  document.getElementById('btnRunServer').disabled = false;
-  document.getElementById('btnStopServer').classList.add('hidden');
-  rbLog('Stopped local control agent process.');
+    // Close the browser-side control connection immediately as well as asking
+    // the backend to stop the native process.
+    if (agentSocket) {
+      try { agentSocket.close(1000, 'Host stopped agent'); } catch (_) {}
+    }
+    agentSocket = null;
+    agentConnected = false;
+    agentConnecting = false;
+    agentConsoleEnabled = false;
+    rbUpdateConsoleAvailability();
+
+    const data = await rbApi('/api/agent/stop', { method: 'POST' });
+    clearInterval(agentServerPollTimer);
+    rbAgentConsoleAppend(`\n=== agent stopped${data.graceful ? ' cleanly' : ''} ===\n`);
+    rbSetAgentServerUI(false, null, 'Stopped');
+    rbLog('Stopped local control agent process and revoked remote control.');
+    rbCloseAgentStopModal();
+  } catch (e) {
+    if (state) state.textContent = 'Unable to stop the agent: ' + e.message;
+  } finally {
+    if (confirmBtn) confirmBtn.disabled = false;
+  }
 }
 
 const savedAgentToken = localStorage.getItem('rb_agent_token');
+document.addEventListener('DOMContentLoaded', () => {
+  if (savedAgentToken && document.getElementById('agentToken')) {
+    document.getElementById('agentToken').value = savedAgentToken;
+    rbSetAgentTokenState(savedAgentToken);
+  }
+  rbLoadAgentConfig();
+  rbLoadAgentServerStatus();
+  // Also recover a token if the agent console was populated by a restored
+  // page state before this script finishes initializing.
+  rbExtractAgentToken();
+});
+
 document.addEventListener('DOMContentLoaded', () => {
   if (savedAgentToken && document.getElementById('agentToken')) {
     document.getElementById('agentToken').value = savedAgentToken;

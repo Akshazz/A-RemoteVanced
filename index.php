@@ -477,6 +477,7 @@ if ($path === '/api/signal/poll' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 $rbAgentDir = __DIR__ . '/agent';
 $rbAgentLog = $rbAgentDir . '/agent-run.log';
 $rbAgentPidFile = $rbAgentDir . '/agent-run.pid';
+$rbAgentStopFile = $rbAgentDir . '/.stop-request';
 $rbAgentIsWindows = stripos(PHP_OS, 'WIN') === 0;
 
 if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -490,6 +491,7 @@ if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if (!is_dir($rbAgentDir)) rb_json(['error' => 'agent/ directory not found'], 500);
+    @unlink($rbAgentStopFile);
 
     file_put_contents($rbAgentLog, "=== starting: cd agent && npm install && node control-agent.js (" . date('c') . ") ===\n");
 
@@ -527,6 +529,21 @@ if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     rb_json(['ok' => true, 'pid' => $pid]);
 }
 
+/** Current native agent process state. Local-only because it exposes a
+ * process identifier and whether OS-level remote control is active. */
+if ($path === '/api/agent/status' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    rb_require_local();
+    $pid = is_file($rbAgentPidFile) ? (int)trim((string)file_get_contents($rbAgentPidFile)) : 0;
+    $running = $pid > 0 && rb_pid_alive($pid);
+    if (!$running && is_file($rbAgentPidFile)) @unlink($rbAgentPidFile);
+    rb_json([
+        'ok' => true,
+        'running' => $running,
+        'pid' => $running ? $pid : null,
+        'stop_requested' => is_file($rbAgentStopFile),
+    ]);
+}
+
 /** Polled by the page's in-browser console to tail the agent's output. */
 if ($path === '/api/agent/output' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     rb_require_local();
@@ -558,15 +575,31 @@ if ($path === '/api/agent/output' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 if ($path === '/api/agent/stop' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     rb_require_local();
     $pid = is_file($rbAgentPidFile) ? (int)trim((string)file_get_contents($rbAgentPidFile)) : 0;
-    if ($pid > 0 && rb_pid_alive($pid)) {
-        if ($rbAgentIsWindows) {
-            shell_exec('taskkill /T /F /PID ' . $pid . ' 2>NUL');
-        } else {
-            posix_kill($pid, SIGTERM);
+    $running = $pid > 0 && rb_pid_alive($pid);
+
+    if ($running) {
+        // Ask control-agent.js to shut down cleanly first. It closes its
+        // WebSockets, stops the remote shell, kills the PowerShell input
+        // helper, and revokes all authenticated control sessions.
+        @file_put_contents($rbAgentStopFile, date('c'));
+        $deadline = microtime(true) + 4.0;
+        while (microtime(true) < $deadline && rb_pid_alive($pid)) {
+            usleep(100000);
+        }
+
+        // Fallback only if the agent did not honor the graceful request.
+        if (rb_pid_alive($pid)) {
+            if ($rbAgentIsWindows) {
+                shell_exec('taskkill /T /F /PID ' . $pid . ' 2>NUL');
+            } elseif (function_exists('posix_kill')) {
+                @posix_kill($pid, SIGTERM);
+            }
         }
     }
+
+    @unlink($rbAgentStopFile);
     @unlink($rbAgentPidFile);
-    rb_json(['ok' => true]);
+    rb_json(['ok' => true, 'stopped' => true, 'graceful' => !$running || !rb_pid_alive($pid)]);
 }
 
 /* ---------------------------------------------------------------------
@@ -821,21 +854,38 @@ function rb_run_bounded_process(string $command, int $timeoutMs = 5000): array {
     ], $pipes, __DIR__);
 
     if (!is_resource($proc)) {
-        return ['ok' => false, 'timed_out' => false];
+        return ['ok' => false, 'timed_out' => false, 'aborted' => false];
     }
 
     @fclose($pipes[0]);
     $startedAt = microtime(true);
     $timedOut = false;
+    $aborted = false;
 
     // Non-blocking reads prevent a full stderr/stdout pipe from deadlocking
     // the request on unusual Windows/PHP configurations.
     stream_set_blocking($pipes[1], false);
     stream_set_blocking($pipes[2], false);
 
+    // Poll frequently (every 50ms) rather than blocking the whole timeout,
+    // so we notice both completion and a client-side "Force stop" quickly
+    // instead of always running to the full timeout.
     while (true) {
         $status = proc_get_status($proc);
         if (!$status['running']) break;
+
+        // If the browser aborted the fetch (Force stop button) or navigated
+        // away, PHP detects the dropped connection here. Kill the scan
+        // immediately instead of letting it run out its full timeout with
+        // nobody listening for the result.
+        if (connection_aborted()) {
+            $aborted = true;
+            @proc_terminate($proc, 15);
+            usleep(100000);
+            $status = proc_get_status($proc);
+            if ($status['running']) @proc_terminate($proc, 9);
+            break;
+        }
 
         if ((microtime(true) - $startedAt) * 1000 >= $timeoutMs) {
             $timedOut = true;
@@ -855,8 +905,9 @@ function rb_run_bounded_process(string $command, int $timeoutMs = 5000): array {
     $exitCode = @proc_close($proc);
 
     return [
-        'ok' => !$timedOut && $exitCode === 0,
+        'ok' => !$timedOut && !$aborted && $exitCode === 0,
         'timed_out' => $timedOut,
+        'aborted' => $aborted,
         'exit_code' => $exitCode,
         'stdout' => $stdout,
         'stderr' => $stderr,
@@ -872,7 +923,14 @@ if ($path === '/api/network/scan' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $isWindows = stripos(PHP_OS, 'WIN') === 0;
     $scanTimeoutMs = 6000;
-    $result = ['ok' => false, 'timed_out' => false];
+    $result = ['ok' => false, 'timed_out' => false, 'aborted' => false];
+
+    // Don't let PHP silently kill this request the instant the browser
+    // disconnects (e.g. the "Force stop" button aborting the fetch). We want
+    // to detect that ourselves inside rb_run_bounded_process so the child
+    // scan process gets terminated cleanly instead of possibly being left
+    // running past our own cleanup code.
+    ignore_user_abort(true);
 
     if ($isWindows) {
         $script = __DIR__ . DIRECTORY_SEPARATOR . 'agent' . DIRECTORY_SEPARATOR . 'network-scan.ps1';
@@ -891,6 +949,12 @@ if ($path === '/api/network/scan' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             rb_json(['error' => 'Network scan helper is missing'], 500);
         }
+    }
+
+    // The browser already disconnected (Force stop / navigated away) — no
+    // point doing DB/ARP work or trying to send a response nobody will read.
+    if (!empty($result['aborted'])) {
+        exit;
     }
 
     // A timeout is a bounded scan completion, not a server failure. ARP may
@@ -1027,6 +1091,10 @@ main{max-width:900px;margin:0 auto;width:100%}
 .link-btn:hover{border-color:#3a5680;background:#0e1b2f}
 
 /* ---- Initial setup modal (Local vs Internet + advanced manual) ---- */
+.agent-stop-modal{max-width:560px}
+.agent-stop-warning{border:1px solid #5a3340;background:#28151c;border-radius:12px;padding:14px 16px;color:#f0cbd3}
+.agent-stop-warning strong{color:#fff}
+.agent-stop-warning ul{margin:9px 0 0 20px;padding:0;line-height:1.7}
 .modal-overlay{position:fixed;inset:0;background:rgba(4,9,18,.72);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:300;padding:20px}
 .modal-overlay.hidden{display:none !important}
 .modal-box{background:#0c1c33;border:1px solid #253b5a;border-radius:20px;max-width:720px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 30px 90px rgba(0,0,0,.5)}
@@ -1136,6 +1204,35 @@ main{max-width:900px;margin:0 auto;width:100%}
   </div>
 </div>
 
+<!-- Native agent stop confirmation -->
+<div id="agentStopModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="agentStopTitle">
+  <div class="modal-box agent-stop-modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="agentStopTitle">Stop native control agent?</h2>
+        <p>This immediately revokes remote mouse/keyboard control and closes the remote console.</p>
+      </div>
+      <button class="modal-close" type="button" onclick="rbCloseAgentStopModal()" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body" style="padding:20px 24px">
+      <div class="agent-stop-warning">
+        <strong>What will happen</strong>
+        <ul>
+          <li>All authenticated agent connections will be disconnected.</li>
+          <li>Any active remote shell will be terminated.</li>
+          <li>The Windows input backend will be stopped.</li>
+          <li>The agent will no longer accept remote-control commands.</li>
+        </ul>
+      </div>
+      <div id="agentStopModalState" class="muted" style="margin-top:12px">The agent is currently running.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="secondary" type="button" onclick="rbCloseAgentStopModal()">Cancel</button>
+      <button class="danger" id="btnConfirmStopAgent" type="button" onclick="rbConfirmStopAgent()">Stop Agent</button>
+    </div>
+  </div>
+</div>
+
 <div class="layout">
 <aside class="sidebar sidebar-left">
   <div class="card">
@@ -1202,9 +1299,10 @@ main{max-width:900px;margin:0 auto;width:100%}
       <h2 style="font-size:18px">Native control agent (required for remote control)</h2>
       <p class="muted">A browser tab can't move your OS mouse or type into other apps by itself. To allow real control, start the small local agent below — the page runs it for you, no terminal needed. Only do this if you trust the person who will be controlling this computer.</p>
       <div class="row">
-        <button id="btnRunServer" class="secondary" onclick="rbStartAgentServer()">Run server</button>
-        <button id="btnStopServer" class="secondary hidden" onclick="rbStopAgentServer()">Stop server</button>
-        <span id="agentServerState" class="muted">Not running</span>
+        <button id="btnRunServer" class="secondary" onclick="rbStartAgentServer()">Run agent</button>
+        <button id="btnStopServer" class="danger hidden" onclick="rbOpenAgentStopModal()">Stop agent</button>
+        <span id="agentServerState" class="muted">Agent: checking…</span>
+        <span id="agentServerBadge" class="badge warn">STOPPED</span>
       </div>
       <div class="term-wrap">
         <div class="term-bar">
@@ -1302,6 +1400,7 @@ Click "Run server" to start — output streams here.
     <div id="deviceUnlocked" class="hidden">
       <div class="row" style="margin-top:10px">
         <button id="btnScanDevices" class="secondary" onclick="rbScanDevices()">Scan network</button>
+        <button id="btnStopScan" class="secondary hidden" style="border-color:#c0392b;color:#ff8a80" onclick="rbStopScan()">Force stop</button>
         <button class="secondary" onclick="rbLoadDevices()">Refresh</button>
         <button class="secondary" onclick="rbLockDevices()">Lock</button>
       </div>

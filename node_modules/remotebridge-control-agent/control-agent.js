@@ -56,6 +56,7 @@ const HOST = process.env.RB_AGENT_HOST || '127.0.0.1';
 const PORT = Number(process.env.RB_AGENT_PORT || 8791);
 const TOKEN_FILE = path.join(__dirname, '.token');
 const PS_SCRIPT = path.join(__dirname, 'win-input.ps1');
+const STOP_FILE = path.join(__dirname, '.stop-request');
 
 // Remote console is opt-in — see the security note above.
 const CONSOLE_ENABLED = /^(1|true|yes)$/i.test(process.env.RB_AGENT_ENABLE_CONSOLE || '');
@@ -75,6 +76,31 @@ function loadOrCreateToken() {
 }
 
 const TOKEN = loadOrCreateToken();
+
+/* Graceful shutdown requested by the local PHP Host UI. The marker-file
+ * mechanism avoids force-killing Node/PowerShell and lets the agent revoke
+ * authenticated clients and terminate the remote shell cleanly. */
+let shuttingDown = false;
+function requestShutdown(reason = 'Agent stopped by Host UI') {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\\n${reason}`);
+  stopShell();
+  for (const ws of authenticatedSockets) {
+    try { ws.send(JSON.stringify({ type: 'agent_stopped', message: reason })); } catch (_) {}
+    try { ws.close(); } catch (_) {}
+  }
+  authenticatedSockets.clear();
+  if (inputProc) {
+    try { inputProc.kill(); } catch (_) {}
+    inputProc = null;
+    inputReady = false;
+  }
+  try { wss.close(); } catch (_) {}
+  try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch (_) {}
+  setTimeout(() => process.exit(0), 100);
+}
+
 /** Sockets that have successfully authenticated with TOKEN. A Set (not just
  * a counter) so the console feature can broadcast output to every
  * authenticated tab, and so a socket can be dropped from tracking exactly
@@ -273,6 +299,14 @@ function handleConsoleMessage(cmd) {
 /* ---------------------------- Server ---------------------------- */
 
 const wss = new WebSocketServer({ host: HOST, port: PORT });
+
+const stopWatcher = setInterval(() => {
+  if (!shuttingDown && fs.existsSync(STOP_FILE)) {
+    requestShutdown('Agent stopped from the RemoteBridge Host interface');
+  }
+}, 300);
+
+
 const displayHost = HOST === '0.0.0.0' ? '<server-LAN-IP>' : HOST;
 console.log(`RemoteBridge control agent listening on ws://${displayHost}:${PORT}`);
 console.log(`Agent bind address: ${HOST}:${PORT}`);
@@ -315,9 +349,9 @@ wss.on('connection', (ws) => {
   });
 });
 
-process.on('SIGINT', () => {
-  console.log('\nStopping — all control revoked.');
-  stopShell();
-  if (inputProc) inputProc.kill();
-  process.exit(0);
+process.on('SIGINT', () => requestShutdown('Agent stopped from local console'));
+process.on('SIGTERM', () => requestShutdown('Agent stopped by system request'));
+process.on('exit', () => {
+  try { clearInterval(stopWatcher); } catch (_) {}
+  try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch (_) {}
 });
