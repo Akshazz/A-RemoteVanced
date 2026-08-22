@@ -1191,6 +1191,10 @@ main{max-width:900px;margin:0 auto;width:100%}
       <label class="row" style="margin-top:12px;cursor:pointer">
         <input type="checkbox" id="allowControl"> Allow the connected viewer to control this mouse &amp; keyboard
       </label>
+      <label class="row" style="margin-top:8px;cursor:pointer">
+        <input type="checkbox" id="allowConsole" disabled> Allow the connected viewer to open a <strong>remote console</strong> (advanced — runs real commands on this computer)
+      </label>
+      <p id="consoleAvailabilityHint" class="muted" style="font-size:12.5px;margin:4px 0 0 26px">Connect the native control agent above to enable this.</p>
       <div class="row" style="margin-top:10px"><button class="danger" onclick="rbStopHosting()">Stop sharing</button></div>
     </div>
 
@@ -1228,6 +1232,14 @@ Click "Run server" to start — output streams here.
       <div id="agentDiagnostics" class="connection-diagnostics" aria-live="polite">
         <span>PHP signaling: checking…</span><span>Agent endpoint: checking…</span>
       </div>
+
+      <div class="term-wrap" style="margin-top:14px">
+        <div class="term-bar">
+          <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span> remote console (read-only mirror of what the viewer runs)</span>
+          <button class="secondary" onclick="document.getElementById('hostConsoleLog').textContent=''">Clear</button>
+        </div>
+        <pre id="hostConsoleLog" class="term" aria-live="polite">Nothing yet. This fills in only while "Allow remote console" is checked above and the viewer opens one.</pre>
+      </div>
     </div>
   </section>
 
@@ -1246,6 +1258,27 @@ Click "Run server" to start — output streams here.
     <div id="viewerVideoWrap" class="hidden" style="margin-top:16px">
       <video id="viewerVideo" autoplay playsinline></video>
       <div class="row" style="margin-top:10px"><button class="danger" onclick="rbDisconnect()">Disconnect</button></div>
+
+      <div class="card" style="margin-top:18px;padding:18px">
+        <h2 style="font-size:16px">Remote console</h2>
+        <p class="muted" style="font-size:12.5px">Only works if the host has checked "Allow the connected viewer to open a remote console" on their side, and started their agent with the console feature enabled. Runs git-bash/bash on the host if available, otherwise the platform default shell.</p>
+        <div class="row" style="margin-top:8px">
+          <button id="btnConsoleStart" class="secondary" disabled onclick="rbConsoleStart()">Start console</button>
+          <button id="btnConsoleStop" class="secondary" disabled onclick="rbConsoleStop()">Stop console</button>
+        </div>
+        <div class="term-wrap" style="margin-top:10px">
+          <div class="term-bar">
+            <span class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span> remote shell</span>
+            <button class="secondary" onclick="document.getElementById('viewerConsoleLog').textContent=''">Clear</button>
+          </div>
+          <pre id="viewerConsoleLog" class="term" aria-live="polite">Click "Start console" once connected.</pre>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="consoleInput" placeholder="Type a command and press Enter" disabled
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();rbConsoleSendLine();}">
+          <button id="btnConsoleSend" class="secondary" disabled onclick="rbConsoleSendLine()">Send</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -1308,6 +1341,6 @@ function rbShowTab(which){
   document.getElementById('panelViewer').classList.toggle('hidden', which!=='viewer');
 }
 </script>
-<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260820-remoteid-fix3"></script>
+<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260821-remote-console"></script>
 </body>
 </html>

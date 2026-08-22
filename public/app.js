@@ -614,13 +614,26 @@ function rbConnectAgent() {
         if (agentSocket !== socket) return;
         agentConnecting = false;
         agentConnected = true;
+        agentConsoleEnabled = !!msg.console_enabled;
         rbAgentStatus('Native control agent: connected');
+        rbUpdateConsoleAvailability();
       } else if (msg.type === 'auth_fail') {
         if (agentSocket !== socket) return;
         agentConnecting = false;
         agentConnected = false;
         rbAgentStatus('Native control agent: wrong token');
         socket.close();
+      } else if (typeof msg.type === 'string' && msg.type.startsWith('console_')) {
+        // Output from the shell running on THIS (host) machine. Mirror it
+        // into the host's own on-page console log for visibility, and relay
+        // it down the WebRTC control channel to whichever viewer(s) are
+        // currently connected, so they see the output they asked for.
+        rbHostConsoleAppend(msg);
+        hostSessions.forEach((state) => {
+          if (state.consoleChannel && state.consoleChannel.readyState === 'open') {
+            try { state.consoleChannel.send(JSON.stringify(msg)); } catch (_) {}
+          }
+        });
       }
     } catch (_) {}
   };
@@ -628,13 +641,17 @@ function rbConnectAgent() {
     if (agentSocket !== socket) return;
     agentConnecting = false;
     agentConnected = false;
+    agentConsoleEnabled = false;
     rbAgentStatus('Native control agent: not connected');
+    rbUpdateConsoleAvailability();
   };
   socket.onerror = () => {
     if (agentSocket !== socket) return;
     agentConnecting = false;
     agentConnected = false;
+    agentConsoleEnabled = false;
     rbAgentStatus('Native control agent: connection error');
+    rbUpdateConsoleAvailability();
   };
 }
 
@@ -779,6 +796,50 @@ function rbForwardControlToAgent(cmd) {
   agentSocket.send(JSON.stringify(cmd));
 }
 
+/* ------------------------- Remote console (host side) ------------------------- */
+/* A viewer's console_* messages arrive over the same 'control' data channel
+ * as mouse/keyboard events (see pc.ondatachannel below) and are routed here
+ * instead of rbForwardControlToAgent, gated by a SEPARATE checkbox from
+ * mouse/keyboard control since running commands is a much bigger grant of
+ * trust than moving the pointer. */
+
+let agentConsoleEnabled = false; // whether the connected agent process was started with RB_AGENT_ENABLE_CONSOLE=1
+
+function rbUpdateConsoleAvailability() {
+  const hint = document.getElementById('consoleAvailabilityHint');
+  const checkbox = document.getElementById('allowConsole');
+  if (!hint || !checkbox) return;
+  if (!agentConnected) {
+    hint.textContent = 'Connect the native control agent above to enable this.';
+    checkbox.disabled = true;
+  } else if (!agentConsoleEnabled) {
+    hint.textContent = 'The running agent was not started with RB_AGENT_ENABLE_CONSOLE=1, so this is unavailable. See the README.';
+    checkbox.disabled = true;
+  } else {
+    hint.textContent = 'The viewer will be able to run real commands on this computer while checked.';
+    checkbox.disabled = false;
+  }
+}
+
+function rbForwardConsoleToAgent(cmd) {
+  const allow = document.getElementById('allowConsole')?.checked;
+  if (!allow) return; // host has not granted remote-console permission
+  if (!agentConnected || !agentSocket || agentSocket.readyState !== WebSocket.OPEN) return;
+  agentSocket.send(JSON.stringify(cmd));
+}
+
+/** Mirrors console output into the host's own page so the person sitting at
+ * the keyboard can always see exactly what the remote viewer is running. */
+function rbHostConsoleAppend(msg) {
+  const el = document.getElementById('hostConsoleLog');
+  if (!el) return;
+  if (msg.type === 'console_started') el.textContent += `\n$ [remote console started: ${msg.shell}]\n`;
+  else if (msg.type === 'console_output') el.textContent += msg.data;
+  else if (msg.type === 'console_exit') el.textContent += `\n[remote console closed]\n`;
+  else if (msg.type === 'console_error') el.textContent += `\n[error] ${msg.message}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
 /* ----------------------------- Host ------------------------------ */
 
 let hostStream = null;
@@ -869,20 +930,33 @@ async function rbAcceptSession(sessionId, initiatorId, deviceInfo) {
   hostStream.getTracks().forEach(track => pc.addTrack(track, hostStream));
   hostStream.getVideoTracks()[0].onended = () => rbStopHosting();
 
-  const state = { pc, sinceId: 0, controlChannel: null, remoteId: initiatorId, deviceInfo };
+  const state = { pc, sinceId: 0, controlChannel: null, consoleChannel: null, remoteId: initiatorId, deviceInfo };
   hostSessions.set(sessionId, state);
   rbRenderConnectedViewers();
 
-  // The viewer creates the "control" data channel (it's the offerer); we
-  // just receive it here and wire up incoming input events.
+  // The viewer creates both data channels (it's the offerer); we just
+  // receive them here and wire up incoming events.
+  //  - 'control': mouse/keyboard, unreliable/unordered — dropping a stale
+  //    pointer position is fine and keeps latency low.
+  //  - 'console': remote-console I/O, reliable/ordered — dropping bytes of
+  //    a typed command or its output would corrupt the session, so this is
+  //    a separate channel with normal (reliable) delivery.
   pc.ondatachannel = (ev) => {
-    if (ev.channel.label !== 'control') return;
-    state.controlChannel = ev.channel;
-    ev.channel.onmessage = (msgEv) => {
-      let cmd;
-      try { cmd = JSON.parse(msgEv.data); } catch (_) { return; }
-      rbForwardControlToAgent(cmd);
-    };
+    if (ev.channel.label === 'control') {
+      state.controlChannel = ev.channel;
+      ev.channel.onmessage = (msgEv) => {
+        let cmd;
+        try { cmd = JSON.parse(msgEv.data); } catch (_) { return; }
+        rbForwardControlToAgent(cmd);
+      };
+    } else if (ev.channel.label === 'console') {
+      state.consoleChannel = ev.channel;
+      ev.channel.onmessage = (msgEv) => {
+        let cmd;
+        try { cmd = JSON.parse(msgEv.data); } catch (_) { return; }
+        rbForwardConsoleToAgent(cmd);
+      };
+    }
   };
 
   pc.onicecandidate = (ev) => {
@@ -939,6 +1013,8 @@ let viewerPollTimer = null;
 let viewerSinceId = 0;
 let viewerStatusTimer = null;
 let viewerControlChannel = null;
+let viewerConsoleChannel = null;
+let viewerConsoleStarted = false;
 let viewerLastMove = 0;
 
 async function rbConnectToRemote() {
@@ -985,6 +1061,26 @@ async function rbStartViewerPeer(sessionId) {
   viewerControlChannel = pc.createDataChannel('control', { ordered: true, maxRetransmits: 0 });
   viewerControlChannel.onopen = () => rbLog('Control channel open.');
   viewerControlChannel.onclose = () => rbLog('Control channel closed.');
+
+  // Separate, reliable channel for the remote console. Unlike 'control'
+  // above, dropped bytes here would corrupt commands/output, so this one
+  // uses ordered/reliable delivery (the WebRTC default).
+  viewerConsoleChannel = pc.createDataChannel('console', { ordered: true });
+  viewerConsoleChannel.onopen = () => {
+    rbLog('Console channel open.');
+    const btn = document.getElementById('btnConsoleStart');
+    if (btn) btn.disabled = false;
+  };
+  viewerConsoleChannel.onclose = () => {
+    rbLog('Console channel closed.');
+    viewerConsoleStarted = false;
+    rbSetConsoleUiState('closed');
+  };
+  viewerConsoleChannel.onmessage = (msgEv) => {
+    let msg;
+    try { msg = JSON.parse(msgEv.data); } catch (_) { return; }
+    rbViewerConsoleHandle(msg);
+  };
 
   pc.ontrack = (ev) => {
     document.getElementById('viewerVideoWrap').classList.remove('hidden');
@@ -1090,6 +1186,9 @@ function rbDisconnect() {
   if (viewerPc) viewerPc.close();
   viewerPc = null;
   viewerControlChannel = null;
+  viewerConsoleChannel = null;
+  viewerConsoleStarted = false;
+  rbSetConsoleUiState('closed');
   document.getElementById('viewerVideoWrap').classList.add('hidden');
   document.getElementById('viewerConnInfo').classList.add('hidden');
   document.getElementById('viewerConnInfo').innerHTML = '';
@@ -1100,4 +1199,68 @@ function rbDisconnect() {
     rbApi('/api/session/close', { method: 'POST', body: JSON.stringify({ session_id: viewerSessionId }) }).catch(() => {});
   }
   viewerSessionId = null;
+}
+
+/* ------------------------- Remote console (viewer side) ------------------------- */
+
+/** Reflects channel/session state onto the console panel's buttons so the
+ * viewer can't click Start before a channel exists or Send before a shell
+ * is actually running. 'closed' | 'ready' | 'running'. */
+function rbSetConsoleUiState(state) {
+  const btnStart = document.getElementById('btnConsoleStart');
+  const btnStop = document.getElementById('btnConsoleStop');
+  const input = document.getElementById('consoleInput');
+  const btnSend = document.getElementById('btnConsoleSend');
+  if (!btnStart || !btnStop || !input || !btnSend) return;
+  const channelOpen = !!(viewerConsoleChannel && viewerConsoleChannel.readyState === 'open');
+  btnStart.disabled = !channelOpen || state === 'running';
+  btnStop.disabled = state !== 'running';
+  input.disabled = state !== 'running';
+  btnSend.disabled = state !== 'running';
+}
+
+function rbConsoleLog(text) {
+  const el = document.getElementById('viewerConsoleLog');
+  if (!el || !text) return;
+  el.textContent += text;
+  el.scrollTop = el.scrollHeight;
+}
+
+function rbViewerConsoleHandle(msg) {
+  if (msg.type === 'console_started') {
+    viewerConsoleStarted = true;
+    rbSetConsoleUiState('running');
+    rbConsoleLog(`\n$ [remote console started: ${msg.shell}]\n`);
+  } else if (msg.type === 'console_output') {
+    rbConsoleLog(msg.data);
+  } else if (msg.type === 'console_exit') {
+    viewerConsoleStarted = false;
+    rbSetConsoleUiState('ready');
+    rbConsoleLog('\n[remote console closed]\n');
+  } else if (msg.type === 'console_error') {
+    rbConsoleLog(`\n[error] ${msg.message}\n`);
+    if (!viewerConsoleStarted) rbSetConsoleUiState('ready');
+  }
+}
+
+function rbConsoleStart() {
+  if (!viewerConsoleChannel || viewerConsoleChannel.readyState !== 'open') return;
+  document.getElementById('viewerConsoleLog').textContent = '';
+  viewerConsoleChannel.send(JSON.stringify({ type: 'console_start' }));
+}
+
+function rbConsoleSendLine() {
+  const input = document.getElementById('consoleInput');
+  if (!input || !viewerConsoleChannel || viewerConsoleChannel.readyState !== 'open') return;
+  const line = input.value;
+  if (line.length === 0) return;
+  viewerConsoleChannel.send(JSON.stringify({ type: 'console_input', data: line + '\n' }));
+  input.value = '';
+}
+
+function rbConsoleStop() {
+  if (!viewerConsoleChannel || viewerConsoleChannel.readyState !== 'open') return;
+  viewerConsoleChannel.send(JSON.stringify({ type: 'console_stop' }));
+  viewerConsoleStarted = false;
+  rbSetConsoleUiState('ready');
 }

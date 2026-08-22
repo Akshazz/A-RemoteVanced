@@ -1,8 +1,8 @@
 {
   "name": "remote-bridge",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "RemoteBridge PHP/MySQL remote support application with optional Windows control agent.",
+  "description": "RemoteBridge PHP/MySQL remote support application with an optional local control agent for native mouse/keyboard input and an opt-in remote console (git-bash/bash/cmd).",
   "workspaces": [
     "agent"
   ],
