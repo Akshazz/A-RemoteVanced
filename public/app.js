@@ -199,6 +199,8 @@ function rbSetScanningUI(scanning) {
     btn.textContent = scanning ? 'Scanning…' : 'Scan network';
   }
   if (stopBtn) stopBtn.classList.toggle('hidden', !scanning);
+  rbStopAllState.scanning = scanning;
+  rbRefreshStopAllVisibility();
 }
 
 async function rbScanDevices() {
@@ -747,6 +749,8 @@ function rbSetAgentServerUI(running, pid = null, message = null) {
   const badge = document.getElementById('agentServerBadge');
   const runBtn = document.getElementById('btnRunServer');
   const stopBtn = document.getElementById('btnStopServer');
+  rbStopAllState.agentRunning = running;
+  rbRefreshStopAllVisibility();
   if (!stateEl || !runBtn || !stopBtn) return;
 
   if (running) {
@@ -768,6 +772,68 @@ function rbSetAgentServerUI(running, pid = null, message = null) {
     runBtn.disabled = false;
     stopBtn.classList.add('hidden');
   }
+}
+
+/* --------------------- Global "Stop all running" tool --------------------- */
+/* A single, always-reachable kill switch in the navbar — not buried inside
+ * whichever tab happens to be open. Covers every long-running / background
+ * thing this page can have going at once on this tab: the local network
+ * scan, the native command-line agent process (and by extension its
+ * mouse/keyboard input backend and any host-side remote console shell,
+ * which stopping the agent already tears down), and a remote console
+ * session this tab is actively driving as a viewer. Whichever of those
+ * aren't currently active are simply skipped. */
+
+const rbStopAllState = { scanning: false, agentRunning: false, viewerConsoleActive: false };
+
+function rbRefreshStopAllVisibility() {
+  const btn = document.getElementById('btnStopAll');
+  if (!btn) return;
+  const anyActive = rbStopAllState.scanning || rbStopAllState.agentRunning || rbStopAllState.viewerConsoleActive;
+  btn.classList.toggle('hidden', !anyActive);
+}
+
+async function rbStopAll() {
+  const btn = document.getElementById('btnStopAll');
+  const running = [];
+  if (rbStopAllState.scanning) running.push('the network scan');
+  if (rbStopAllState.agentRunning) running.push('the command-line agent (mouse/keyboard + any remote console)');
+  if (rbStopAllState.viewerConsoleActive) running.push('the remote console session');
+  if (!running.length) return;
+
+  const confirmed = confirm('Stop everything currently running?\n\n' + running.map(r => '• ' + r).join('\n'));
+  if (!confirmed) return;
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+
+  if (rbStopAllState.scanning) rbStopScan();
+
+  if (rbStopAllState.viewerConsoleActive) {
+    try { rbConsoleStop(); } catch (_) {}
+  }
+
+  if (rbStopAllState.agentRunning) {
+    try {
+      if (typeof agentSocket !== 'undefined' && agentSocket) {
+        try { agentSocket.close(1000, 'Host stopped agent'); } catch (_) {}
+        agentSocket = null;
+        agentConnected = false;
+        agentConnecting = false;
+        agentConsoleEnabled = false;
+        rbUpdateConsoleAvailability();
+      }
+      const data = await rbApi('/api/agent/stop', { method: 'POST' });
+      clearInterval(agentServerPollTimer);
+      rbAgentConsoleAppend(`\n=== agent stopped${data.graceful ? ' cleanly' : ''} (stop all) ===\n`);
+      rbSetAgentServerUI(false, null, 'Stopped');
+      rbLog('Stopped local control agent process and revoked remote control.');
+    } catch (e) {
+      rbLog('Failed to stop the agent: ' + e.message);
+    }
+  }
+
+  if (btn) { btn.disabled = false; btn.textContent = 'Stop all running'; }
+  rbRefreshStopAllVisibility();
 }
 
 async function rbLoadAgentServerStatus() {
@@ -1182,6 +1248,8 @@ async function rbStartViewerPeer(sessionId) {
   viewerConsoleChannel.onclose = () => {
     rbLog('Console channel closed.');
     viewerConsoleStarted = false;
+    rbStopAllState.viewerConsoleActive = false;
+    rbRefreshStopAllVisibility();
     rbSetConsoleUiState('closed');
   };
   viewerConsoleChannel.onmessage = (msgEv) => {
@@ -1296,6 +1364,8 @@ function rbDisconnect() {
   viewerControlChannel = null;
   viewerConsoleChannel = null;
   viewerConsoleStarted = false;
+  rbStopAllState.viewerConsoleActive = false;
+  rbRefreshStopAllVisibility();
   rbSetConsoleUiState('closed');
   document.getElementById('viewerVideoWrap').classList.add('hidden');
   document.getElementById('viewerConnInfo').classList.add('hidden');
@@ -1337,12 +1407,16 @@ function rbConsoleLog(text) {
 function rbViewerConsoleHandle(msg) {
   if (msg.type === 'console_started') {
     viewerConsoleStarted = true;
+    rbStopAllState.viewerConsoleActive = true;
+    rbRefreshStopAllVisibility();
     rbSetConsoleUiState('running');
     rbConsoleLog(`\n$ [remote console started: ${msg.shell}]\n`);
   } else if (msg.type === 'console_output') {
     rbConsoleLog(msg.data);
   } else if (msg.type === 'console_exit') {
     viewerConsoleStarted = false;
+    rbStopAllState.viewerConsoleActive = false;
+    rbRefreshStopAllVisibility();
     rbSetConsoleUiState('ready');
     rbConsoleLog('\n[remote console closed]\n');
   } else if (msg.type === 'console_error') {
@@ -1370,5 +1444,7 @@ function rbConsoleStop() {
   if (!viewerConsoleChannel || viewerConsoleChannel.readyState !== 'open') return;
   viewerConsoleChannel.send(JSON.stringify({ type: 'console_stop' }));
   viewerConsoleStarted = false;
+  rbStopAllState.viewerConsoleActive = false;
+  rbRefreshStopAllVisibility();
   rbSetConsoleUiState('ready');
 }

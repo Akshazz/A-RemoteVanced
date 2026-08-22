@@ -1,6 +1,29 @@
 <?php
 declare(strict_types=1);
 
+// Turn a DB outage into a clear, catchable error instead of a raw PHP
+// fatal-error white screen. Registered before database.php/config.php are
+// even required so it's in place no matter where the failure happens.
+set_exception_handler(function (Throwable $e): void {
+    http_response_code(503);
+    $uri = $_SERVER['REQUEST_URI'] ?? '';
+    if (str_contains($uri, '/api/')) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode([
+            'error' => 'Database unavailable. In XAMPP, check that the MySQL service is running (green in the Control Panel) and that config.php matches your host/port/username/password.',
+        ]);
+    } else {
+        header('Content-Type: text/html; charset=utf-8');
+        echo '<!doctype html><meta charset="utf-8"><title>RemoteBridge — Database unavailable</title>'
+           . '<body style="font-family:system-ui,-apple-system,sans-serif;background:#07101f;color:#eaf1ff;padding:40px;max-width:640px;margin:0 auto">'
+           . '<h1>Database unavailable</h1>'
+           . '<p>RemoteBridge could not connect to MySQL/MariaDB. In XAMPP, check that the MySQL service is running (green in the Control Panel), and that <code>config.php</code> matches your host, port, username, and password.</p>'
+           . '<p style="color:#9db0ca;font-size:13px">' . htmlspecialchars($e->getMessage()) . '</p>'
+           . '</body>';
+    }
+    exit;
+});
+
 // Needed so the "Devices on this network" access-control gate can remember
 // that a browser tab unlocked it, across the polling requests it makes.
 // Keep the session cookie inaccessible to JavaScript and scoped to same-site
@@ -714,7 +737,12 @@ function rb_local_subnet_prefix(): ?string {
 
 if ($path === '/api/network/status') {
     rb_require_local();
-    rb_json(['unlocked' => !empty($_SESSION['network_unlocked'])]);
+    $unlocked = !empty($_SESSION['network_unlocked']);
+    // Read-only: release the session lock immediately so this polled endpoint
+    // never queues up behind a slower request (e.g. an in-progress scan)
+    // sharing the same session cookie.
+    session_write_close();
+    rb_json(['unlocked' => $unlocked]);
 }
 
 if ($path === '/api/network/unlock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -741,6 +769,9 @@ if ($path === '/api/network/lock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 if ($path === '/api/network/devices' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     rb_require_local();
     if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
+    // Read-only from here on: drop the session lock before the (fast, but
+    // non-zero) ARP read so this never has to wait on a concurrent scan.
+    session_write_close();
     $devices = rb_arp_table();
     rb_json(['devices' => $devices, 'count' => count($devices)]);
 }
@@ -767,6 +798,12 @@ function rb_is_local_user_ip(?string $ip): bool {
 if ($path === '/api/network/users' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     rb_require_local();
     if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
+
+    // Read-only from here on (ARP read + a SELECT). Release the session lock
+    // now so this endpoint — polled every 10s by the "Users connected
+    // locally" panel — never stalls behind a concurrent /api/network/scan or
+    // any other request sharing this browser's session cookie.
+    session_write_close();
 
     // This endpoint intentionally represents BOTH the network devices visible
     // to the server and the RemoteBridge users currently online on the same LAN.
@@ -918,6 +955,24 @@ if ($path === '/api/network/scan' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     rb_require_local();
     if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
 
+    // This request holds the OS process open for up to $scanTimeoutMs (below)
+    // — long by web-request standards. PHP's default session handler keeps an
+    // exclusive lock on the session file for as long as the request runs, and
+    // every other endpoint here (status/devices/users, the host/viewer
+    // pollers, the presence heartbeat) shares that same session cookie. Left
+    // alone, they'd all queue up behind this one request and the whole app
+    // would appear to freeze for the scan's duration.
+    //
+    // Nothing below this line reads or writes $_SESSION, so it's safe to
+    // release the lock now — that's what actually keeps the scan from
+    // "affecting the rest of the system", NOT detaching the scan process
+    // itself. (Detaching it is deliberately avoided — see
+    // rb_run_bounded_process()'s docblock: a fire-and-forget background
+    // scanner can outlive the request with no way to stop it. Freeing the
+    // session lock gets the same practical result — everything else in the
+    // app keeps working while a scan is running — without that risk.)
+    session_write_close();
+
     $prefix = rb_local_subnet_prefix();
     if (!$prefix) rb_json(['error' => 'Could not determine the local subnet to scan'], 500);
 
@@ -998,6 +1053,10 @@ if ($path !== '/' && $path !== '/index.php') {
 .navbar-brand{display:flex;flex-direction:column;justify-content:center;min-width:0}
 .navbar-brand h1{margin:0;font-size:19px;line-height:1.2;white-space:nowrap}
 .navbar-brand .sub{color:#8fa2c0;margin:1px 0 0;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stop-all-btn{border:1px solid #c0392b;background:#2a1414;color:#ff8a80;border-radius:999px;padding:9px 16px;font-size:13px;font-weight:700;white-space:nowrap;flex-shrink:0;cursor:pointer;animation:rbStopAllPulse 2s ease-in-out infinite}
+.stop-all-btn:hover{background:#3a1a1a;border-color:#e74c3c}
+.stop-all-btn:disabled{cursor:default;opacity:.7;animation:none}
+@keyframes rbStopAllPulse{0%,100%{box-shadow:0 0 0 0 rgba(231,76,60,.35)}50%{box-shadow:0 0 0 6px rgba(231,76,60,0)}}
 
 h1{margin:0;font-size:clamp(26px,5vw,42px)}.sub{color:#9db0ca;margin:6px 0 0}
 .status{border:1px solid #2c4262;background:#0e1b2f;border-radius:999px;padding:9px 14px;font-size:13px;white-space:nowrap;flex-shrink:0}
@@ -1149,6 +1208,7 @@ main{max-width:900px;margin:0 auto;width:100%}
     <p class="sub">Web-based remote desktop over WebRTC — no install, connect with a Remote ID</p>
   </div>
   <div class="navbar-actions">
+    <button id="btnStopAll" class="stop-all-btn hidden" onclick="rbStopAll()" title="Stop the network scan, the command-line agent, and any active remote console">⏹ Stop all running</button>
     <button class="link-btn" onclick="rbOpenSetupModal()">Setup guide</button>
     <a class="link-btn" href="<?= htmlspecialchars($basePath . '/admin/settings.php', ENT_QUOTES) ?>">Admin settings</a>
     <div id="status" class="status">Checking database…</div>
