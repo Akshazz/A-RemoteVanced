@@ -1,94 +1,121 @@
 # RemoteBridge
 
-## XAMPP
-1. Extract this folder to `C:\xampp\htdocs\A-RemoteVanced`.
-2. Create/import the `remote_bridge` database. The included `database\remote_bridge.sql` is schema-only; alternatively run `php database\migrate.php`.
-3. Confirm `config.php` matches your MySQL/MariaDB credentials.
-4. Open `http://localhost/A-RemoteVanced/`.
+RemoteBridge is a self-hosted remote support / remote desktop application. It's a PHP + MySQL web app that lets one browser tab ("viewer") connect to another browser tab ("host") over WebRTC — screen sharing, mouse/keyboard control, and an optional command console — plus a small optional native agent that injects real OS-level input on the host machine.
 
-## Node control agent (optional)
-From the project root:
+It's built to be run on your own server (or locally via XAMPP/MAMP) for trusted, consenting use — e.g. supporting a friend/relative's PC, or accessing your own machines remotely. It is **not** intended to be exposed to the public internet without further hardening, and the host/agent side must only be run on a machine you intend to let a specific trusted person control.
+
+---
+
+## How it works
+
+RemoteBridge has three cooperating pieces:
+
+1. **PHP/MySQL web application** (`index.php`, `login.php`, `admin/`) — serves the UI, stores user accounts, devices, and sessions, and acts as a **signaling server**: it relays the WebRTC offer/answer/ICE messages between the host and viewer browser tabs so they can establish a direct peer-to-peer connection. It also proxies remote console (shell) input/output between the viewer and the host's local agent.
+2. **Browser app** (`public/app.js`) — runs in both the host's and the viewer's browser tab. The host tab shares its screen via `getDisplayMedia` and (if the native agent is running) forwards input events to it. The viewer tab receives the video stream and sends mouse/keyboard/console commands.
+3. **Local control agent** (`agent/control-agent.js`) — an optional Node.js process that runs **on the host machine only**. Browsers can't control the OS directly, so this small local WebSocket server bridges the gap: it injects real mouse/keyboard input (Windows, via `win-input.ps1` calling `user32.dll`) and, if explicitly enabled, exposes a real shell (cmd/bash/git-bash) to the connected, authenticated browser tab.
+
+### Typical flow
+1. A host device registers itself and gets a 9-digit Remote ID (`/api/register`), then periodically checks in (`/api/heartbeat`).
+2. A signed-in user on the viewer side enters that Remote ID and requests a session (`/api/session/create`).
+3. The host is notified of the pending request (`/api/session/pending`) and accepts or declines (`/api/session/respond`).
+4. Once accepted, both sides exchange WebRTC signaling messages through the server (`/api/signal`, `/api/signal/poll`) and establish a direct peer-to-peer screen-share/control connection.
+5. Optionally, the host starts the local control agent so the viewer can move the real mouse/keyboard, and — only if explicitly enabled — run shell commands.
+6. Either side can end the session (`/api/session/close`).
+
+### Security model (built in)
+- Every page and API action requires a signed-in account (session-based auth, bcrypt password hashes, CSRF token on the login form).
+- Roles: `admin` (manage users, view audit log, change settings) vs `user`.
+- All important events (logins, session creation/accept/close, user management, agent start/stop, network scans) are written to an `audit_log` table.
+- Login attempts are rate-limited per IP+username.
+- The **local control agent** binds to `127.0.0.1` by default and requires a random token (printed on first run / stored in `agent/.token`) before it will accept any command — so no other tab or site in the same browser can command it. LAN exposure (`RB_AGENT_HOST=0.0.0.0`) is opt-in and still token-gated.
+- The agent's **remote console/shell** is a separate, opt-in capability (`RB_AGENT_ENABLE_CONSOLE=1`) — disabled by default because it lets the connected viewer run arbitrary commands on the host.
+- Endpoints that spawn local OS processes (e.g. starting the console bridge) are restricted to `127.0.0.1` on the server side; the LAN device-discovery scan is restricted to clients on the same LAN as the server.
+- `.htaccess` blocks direct web access to `config.php`, `database.php`, `.token`, log/SQL/env files, and the `includes/` folder.
+
+---
+
+## Setup
+
+### Requirements
+- PHP 8+ with `mysqli`
+- MySQL/MariaDB
+- Apache (or another server that reads `.htaccess`) with `mod_rewrite`, or any server configured to route unmatched requests to `index.php`
+- Node.js (only needed if you want the optional local control agent)
+
+### 1. Get the code running behind a web server
+Point your web server's document root at the project folder (this is a normal PHP app — e.g. drop it into `htdocs/` if you're using XAMPP).
+
+### 2. Configure the database connection
+Edit `config.php` (or set the equivalent `RB_DB_*` environment variables — env vars take priority):
+```php
+'database' => [
+    'host' => '127.0.0.1',
+    'port' => 3306,
+    'database' => 'remote_bridge',
+    'username' => 'root',
+    'password' => '',
+],
+```
+
+### 3. Create the database and run migrations
 ```bash
+php database/migrate.php
+```
+This creates the database (if it doesn't exist) and applies every migration in `database/migrations/`, creating the `users`, `devices`, `sessions`, `signals`, `audit_log`, `transfer_history`, and `app_settings` tables. (`database/remote_bridge-OFFICIAL.sql` is a full schema+seed dump you can import directly instead, if you prefer.)
+
+### 4. Sign in
+Visit the app in your browser — you'll land on `login.php`. Sign in with an admin account (create one via the SQL seed/migration, or directly in the `users` table with a bcrypt `password_hash`). From the admin panel (`admin/settings.php`) you can then create additional user/admin accounts, toggle roles, disable accounts, and browse the audit log.
+
+### 5. (Optional) Set up the local control agent — on the *host* machine only
+Only install this on a machine you intend to let a specific, trusted remote person control:
+```bash
+cd agent
 npm install
-npm run start:agent
+node control-agent.js
+# To also allow the remote console/shell feature (opt-in, bigger trust decision):
+RB_AGENT_ENABLE_CONSOLE=1 node control-agent.js      # macOS/Linux
+set RB_AGENT_ENABLE_CONSOLE=1 && node control-agent.js   # Windows cmd
 ```
-The agent is optional and is only needed for native mouse/keyboard control (Windows only)
-and/or the remote console feature (Windows/macOS/Linux). It prints a one-time token —
-paste that into the "Native control agent" box on the Host tab and click Connect.
+On first run it prints a random token (also saved to `agent/.token`). Paste that token into the "Native control agent" field on the Host tab of the RemoteBridge page and click Connect. Real mouse/keyboard input injection currently only works on Windows (via PowerShell/`user32.dll`); the remote console works cross-platform if enabled. Closing the agent process immediately revokes control.
 
-## Remote console (git-bash / bash / cmd)
-The control agent can also give the connected viewer a real command line on your
-machine — like git-bash on Windows, or `bash`/`sh` on macOS/Linux. This is **off by
-default** because it's a much bigger grant of trust than mouse/keyboard input: it lets
-the remote person run arbitrary commands, not just click things.
+---
 
-To turn it on:
-1. Start the agent with the feature enabled:
-   ```bash
-   # macOS/Linux
-   RB_AGENT_ENABLE_CONSOLE=1 npm run start:agent
-   # Windows (cmd)
-   set RB_AGENT_ENABLE_CONSOLE=1 && npm run start:agent
-   # Windows (PowerShell)
-   $env:RB_AGENT_ENABLE_CONSOLE=1; npm run start:agent
-   ```
-2. On the Host tab, connect the agent as usual, then check **"Allow the connected
-   viewer to open a remote console"** (separate from, and in addition to, the mouse/
-   keyboard checkbox).
-3. The viewer sees a "Remote console" panel once connected and can click **Start
-   console** to get a shell. Everything the viewer runs is also mirrored, read-only,
-   into the host's own page, so the person at the keyboard can always see what's
-   being executed.
-4. On Windows the agent looks for Git Bash (`bash.exe`) in the usual install
-   locations and uses it automatically if present, otherwise it falls back to
-   `cmd.exe`. You can force a specific shell with `RB_AGENT_SHELL=/path/to/shell`.
+## Main functions / features
 
-Closing the agent (Ctrl+C), unchecking the host's checkbox, or disconnecting the
-viewer all stop the remote shell. Console output/input travels over its own reliable
-WebRTC data channel, separate from the low-latency/unreliable one used for mouse
-movement, so typed commands and their output can't be silently dropped.
+| Area | What it does |
+|---|---|
+| **Authentication** (`/api/auth/*`, `login.php`) | Session login/logout, CSRF-protected login form, "who am I" check, rate-limited attempts |
+| **Admin panel** (`/api/admin/*`, `admin/settings.php`) | List/create/update users, reset passwords, toggle admin/user role, enable/disable accounts, view the audit log |
+| **Device registration** (`/api/register`, `/api/heartbeat`, `/api/offline`, `/api/device/lookup`, `/api/devices/recent`, `/api/devices/rename`) | A host machine registers to get a 9-digit Remote ID, sends periodic heartbeats so it shows as online, and can be looked up/renamed/recently-connected-to |
+| **Remote sessions** (`/api/session/*`) | Create a connection request to a Remote ID, host accepts/declines, poll session status, close a session |
+| **WebRTC signaling** (`/api/signal`, `/api/signal/poll`, `/api/ice-servers`) | Relays SDP offer/answer and ICE candidates between host and viewer so they can form a direct peer-to-peer connection; supplies STUN/TURN server info |
+| **Local control agent bridge** (`/api/agent/*`) | Starts/stops/monitors the local Node.js agent process and streams its console output back to the viewer (localhost-only) |
+| **Network discovery** (`/api/network/devices`, `/api/network/users`, `/api/network/scan`) | Sweeps the server's local subnet (via `network-scan.sh`/`network-scan.ps1`) to help find other devices/RemoteBridge instances on the same LAN |
+| **Control agent** (`agent/control-agent.js`) | Injects real mouse/keyboard input on the host (Windows) and, if enabled, exposes a remote shell — gated by a local token and (for the shell) an explicit opt-in flag |
 
-## Login (required)
+---
 
-The app now requires a login before it does anything — registering a device,
-starting a session, or scanning the network. Two accounts already exist in
-`database/remote_bridge.sql`: **sadmin** (admin) and **sadmin1** (user), but
-their passwords are unknown bcrypt hashes from the original dump. Set real
-passwords for them before first use:
-
-```bash
-php -r "echo password_hash('choose-a-strong-password', PASSWORD_BCRYPT), PHP_EOL;"
+## Project structure
+```
+index.php              Main app entry point + almost all JSON API routes
+login.php               Sign-in page
+admin/settings.php      Admin panel (users, roles, audit log)
+includes/bootstrap.php  Shared auth/session/CSRF/audit-log helpers
+config.php               App + database + agent configuration
+database.php             MySQL connection helper
+public/app.js             Browser-side app (host + viewer UI, WebRTC logic)
+agent/control-agent.js   Optional local Node.js control agent
+agent/win-input.ps1       Windows input-injection helper (user32.dll)
+agent/network-scan.sh/.ps1  LAN ping-sweep helpers used by network discovery
+database/migrate.php      Migration runner
+database/migrations/      Individual schema migrations
+database/remote_bridge-OFFICIAL.sql  Full schema + seed dump
+review/                    Prior RBAC code-review documents (historical)
 ```
 
-Then update the database with the hash it prints:
-
-```sql
-UPDATE users SET password_hash = '<hash from above>' WHERE username = 'sadmin';
-UPDATE users SET password_hash = '<hash from above>' WHERE username = 'sadmin1';
-```
-
-To add more accounts later, insert into `users` the same way (`role` is
-`admin` or `user`).
-
-**What logging in changes:**
-- Every device/session/signaling endpoint now requires a logged-in user
-  (`/api/register`, `/api/heartbeat`, `/api/session/*`, the native agent
-  start/stop/output endpoints).
-- Network discovery (`/api/network/devices`, `/api/network/users`,
-  `/api/network/scan`) and `admin/settings.php` are restricted to the
-  `admin` role, on top of the existing same-machine/same-LAN checks.
-- Logins, logouts, and network scans are written to `audit_log`.
-- Login attempts are rate-limited (8 tries per IP+username per 5 minutes).
-
-This is a "quick fix" tier of auth — session-based, no device-ownership
-enforcement beyond the `user_id` column, no MFA/password-reset flow. Treat
-it as enough for a trusted LAN, not as production-grade for internet
-exposure. See `review/RBAC_IMPLEMENTATION_GUIDE.md` and
-`review/CODE_REVIEW_RBAC.md` for what a fuller implementation (per-device
-ownership checks, MFA, password reset, dedicated session/rate-limit tables)
-would add.
+---
 
 ## Notes
-- Runtime agent tokens and `node_modules` are intentionally not packaged.
-- `.htaccess` blocks runtime secrets/configuration files and SQL/log/backup files from HTTP access.
-- The application was syntax-checked with PHP and Node.js after these changes.
+- Keep `config.php`, `database.php`, and `agent/.token` out of version control and off the public web (already blocked by `.htaccess`).
+- Only run the control agent on machines whose owner has agreed to be remotely controlled, and only while a session is actually active.
+- The `review/` folder contains an earlier code review that flagged missing authentication/authorization; that has since been implemented (see `includes/bootstrap.php` and the `/api/admin/*`, `/api/auth/*` routes) — the review docs are kept for historical reference.
