@@ -472,3 +472,6 @@ This package provides everything needed to:
 
 *Complete Package Generated: August 21, 2026*
 *RemoteBridge v2.1.0 - Enhanced with RBAC Analysis & Implementation Guide*
+
+
+Updated build: Network Access Code removed; network discovery scans the detected local subnet directly.

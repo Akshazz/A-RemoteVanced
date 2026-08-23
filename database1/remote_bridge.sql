@@ -33,13 +33,6 @@ CREATE TABLE `app_settings` (
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
---
--- Dumping data for table `app_settings`
---
-
-INSERT INTO `app_settings` (`setting_key`, `setting_value`, `updated_at`) VALUES
-('network_access_code', '0ac2386d8137e8cb', '2026-08-20 07:19:51');
-
 -- --------------------------------------------------------
 
 --

@@ -112,9 +112,8 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 /* -------------------- Local network devices sidebar -------------------- */
-/* Reads this server's own ARP cache via /api/network/devices (local-machine
- * only, same as the agent endpoints) and is itself gated behind an access
- * code (checked server-side, session-based) before any device data loads. */
+/* Network discovery is available directly from the local application. The
+ * server performs the subnet sweep and returns the refreshed ARP/MAC table. */
 
 function rbEsc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -124,111 +123,67 @@ function rbDeviceTile(d) {
   const name = rbEsc(d.hostname || ('Device ' + d.ip.split('.').pop()));
   const mac = rbEsc((d.mac || '').toUpperCase());
   const ip = rbEsc(d.ip);
+  const type = d.type ? `<div class="drow"><span>Type</span><span>${rbEsc(d.type)}</span></div>` : '';
   return `<div class="device-tile">
     <div class="dname"><span class="dot"></span>${name}</div>
     <div class="drow"><span>IP</span><span>${ip}</span></div>
     <div class="drow"><span>MAC</span><span>${mac || 'unknown'}</span></div>
+    ${type}
   </div>`;
-}
-
-function rbShowDeviceLockState(unlocked) {
-  document.getElementById('deviceLocked').classList.toggle('hidden', unlocked);
-  document.getElementById('deviceUnlocked').classList.toggle('hidden', !unlocked);
-}
-
-async function rbCheckDeviceLock() {
-  try {
-    const data = await rbApi('/api/network/status', { method: 'GET' });
-    rbShowDeviceLockState(!!data.unlocked);
-    if (data.unlocked) { rbLoadDevices(); rbLoadLocalUsers(); }
-  } catch (e) { rbShowDeviceLockState(false); }
-}
-
-async function rbUnlockDevices() {
-  const codeInput = document.getElementById('networkAccessCode');
-  const errEl = document.getElementById('networkUnlockError');
-  errEl.classList.add('hidden');
-  try {
-    await rbApi('/api/network/unlock', { method: 'POST', body: JSON.stringify({ code: codeInput.value.trim() }) });
-    codeInput.value = '';
-    rbShowDeviceLockState(true);
-    rbLoadDevices();
-    rbLoadLocalUsers();
-  } catch (e) {
-    errEl.textContent = e.message;
-    errEl.classList.remove('hidden');
-  }
-}
-
-async function rbLockDevices() {
-  try { await rbApi('/api/network/lock', { method: 'POST' }); } catch (e) {}
-  rbShowDeviceLockState(false);
-  const grid = document.getElementById('localUsersGrid');
-  const count = document.getElementById('localUserCount');
-  if (grid) grid.innerHTML = '<div class="device-empty">Locked.</div>';
-  if (count) count.textContent = '';
 }
 
 async function rbLoadDevices() {
   const grid = document.getElementById('deviceGrid');
   const countEl = document.getElementById('deviceCount');
+  if (!grid || !countEl) return;
   try {
     const data = await rbApi('/api/network/devices', { method: 'GET' });
     const devices = data.devices || [];
-    countEl.textContent = devices.length ? `${devices.length} device${devices.length === 1 ? '' : 's'} seen` : '';
+    countEl.textContent = devices.length ? `${devices.length} device${devices.length === 1 ? '' : 's'} visible` : 'No devices currently visible';
     grid.innerHTML = devices.length
       ? devices.map(rbDeviceTile).join('')
-      : '<div class="device-empty">No devices in the ARP cache yet. Try "Scan network".</div>';
+      : '<div class="device-empty">No active devices are currently visible. Click “Scan all devices” to refresh the LAN.</div>';
   } catch (e) {
-    if (e.message === 'locked') { rbShowDeviceLockState(false); return; }
-    grid.innerHTML = `<div class="device-empty">${e.message}</div>`;
+    grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
     countEl.textContent = '';
   }
 }
 
-let rbNetworkScanTimer = null;
-
 async function rbScanDevices() {
   const btn = document.getElementById('btnScanDevices');
   const grid = document.getElementById('deviceGrid');
+  const countEl = document.getElementById('deviceCount');
   if (!btn || btn.dataset.scanning === '1') return;
 
   btn.dataset.scanning = '1';
   btn.disabled = true;
-  btn.textContent = 'Scanning…';
-  if (grid) grid.innerHTML = '<div class="device-empty">Scanning the local network…</div>';
+  btn.textContent = 'Scanning all devices…';
+  if (grid) grid.innerHTML = '<div class="device-empty">Scanning the detected local subnet. RemoteBridge remains usable while discovery runs…</div>';
 
   try {
-    // The server owns the scan and enforces a hard timeout. There is no
-    // browser polling loop and, importantly, no detached/background scanner.
     const result = await rbApi('/api/network/scan', { method: 'POST' });
     const devices = result.devices || [];
-    const countEl = document.getElementById('deviceCount');
     if (countEl) countEl.textContent = devices.length
-      ? `${devices.length} device${devices.length === 1 ? '' : 's'} seen`
-      : 'No devices detected';
+      ? `${devices.length} device${devices.length === 1 ? '' : 's'} found · ${result.subnet || 'local network'}`
+      : `No devices detected · ${result.subnet || 'local network'}`;
     if (grid) grid.innerHTML = devices.length
       ? devices.map(rbDeviceTile).join('')
-      : '<div class="device-empty">No devices were detected on the local network.</div>';
+      : '<div class="device-empty">No active devices were detected on the local subnet.</div>';
 
     if (result.timed_out && grid) {
       const note = document.createElement('div');
       note.className = 'device-empty';
-      note.textContent = 'Scan stopped safely at the time limit. Partial results are shown.';
+      note.textContent = result.message || 'The scan timed out; partial results are shown.';
       grid.appendChild(note);
     }
     await rbLoadLocalUsers();
   } catch (e) {
-    if (e.message === 'locked') rbShowDeviceLockState(false);
-    else if (grid) grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
+    if (grid) grid.innerHTML = `<div class="device-empty">Network scan failed: ${rbEsc(e.message)}<br><span class="muted">Make sure PHP is allowed to execute the local scanner and that this page is running on the same computer as the network you want to scan.</span></div>`;
+    if (countEl) countEl.textContent = 'Scan failed';
   } finally {
     btn.disabled = false;
     btn.dataset.scanning = '0';
-    btn.textContent = 'Scan network';
-    if (rbNetworkScanTimer) {
-      clearInterval(rbNetworkScanTimer);
-      rbNetworkScanTimer = null;
-    }
+    btn.textContent = 'Scan all devices';
   }
 }
 
@@ -255,13 +210,8 @@ async function rbLoadLocalUsers() {
     const data = await rbApi('/api/network/users', { method: 'GET' });
     const users = data.users || [];
     count.textContent = users.length ? `${users.length} local network device${users.length === 1 ? '' : 's'} detected` : 'No local network devices detected';
-    grid.innerHTML = users.length ? users.map(rbLocalUserTile).join('') : '<div class="device-empty">No devices are currently visible on this local network. Click Scan network to refresh the ARP table.</div>';
+    grid.innerHTML = users.length ? users.map(rbLocalUserTile).join('') : '<div class="device-empty">No devices are currently visible on this local network. Click Scan all devices to refresh the network.</div>';
   } catch (e) {
-    if (e.message === 'locked') {
-      grid.innerHTML = '<div class="device-empty">Unlock the network panel to view local users.</div>';
-      count.textContent = '';
-      return;
-    }
     grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
     count.textContent = '';
   }
@@ -269,11 +219,14 @@ async function rbLoadLocalUsers() {
 
 function rbStartLocalUsersPolling() {
   clearInterval(localUsersPollTimer);
+  rbLoadDevices();
   rbLoadLocalUsers();
-  localUsersPollTimer = setInterval(rbLoadLocalUsers, 10000);
+  localUsersPollTimer = setInterval(() => {
+    rbLoadDevices();
+    rbLoadLocalUsers();
+  }, 10000);
 }
 
-rbCheckDeviceLock().then?.(() => {});
 rbStartLocalUsersPolling();
 
 function rbLog(msg) {
@@ -284,9 +237,14 @@ function rbLog(msg) {
 }
 
 async function rbApi(path, opts) {
-  const res = await fetch(rbUrl(path), Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  const url = rbUrl(path);
+  const res = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } }, opts));
+  const contentType = res.headers.get('content-type') || '';
+  const data = contentType.includes('application/json') ? await res.json().catch(() => ({})) : {};
+  if (!res.ok) {
+    const detail = data.error || (res.status === 404 ? `API route not found: ${url}` : `Request failed (${res.status})`);
+    throw new Error(detail);
+  }
   return data;
 }
 
@@ -615,7 +573,8 @@ function rbConnectAgent() {
         agentConnecting = false;
         agentConnected = true;
         agentConsoleEnabled = !!msg.console_enabled;
-        rbAgentStatus('Native control agent: connected');
+        rbAgentStatus('Native control agent: connected — remote mouse/keyboard ready');
+        rbLog('Native control agent connected. Remote mouse/keyboard control is ready.');
         rbUpdateConsoleAvailability();
       } else if (msg.type === 'auth_fail') {
         if (agentSocket !== socket) return;
@@ -678,7 +637,10 @@ function rbExtractAgentToken() {
   tokenEl.value = token;
   localStorage.setItem('rb_agent_token', token);
   rbSetAgentTokenState(token);
-  rbAgentStatus('Complete token read from command-line output. Click Connect to authenticate.');
+  rbAgentStatus('Agent token detected. Connecting…');
+  // Starting the local agent should finish the setup automatically. The
+  // explicit Connect button remains available for manual/re-authentication.
+  setTimeout(() => rbConnectAgent(), 50);
   return token;
 }
 
@@ -783,7 +745,9 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('agentToken').value = savedAgentToken;
     rbSetAgentTokenState(savedAgentToken);
   }
-  rbLoadAgentConfig();
+  rbLoadAgentConfig().then(() => {
+    if (savedAgentToken && /^[A-Za-z0-9_-]{32,128}$/.test(savedAgentToken)) rbConnectAgent();
+  });
   // Also recover a token if the agent console was populated by a restored
   // page state before this script finishes initializing.
   rbExtractAgentToken();
@@ -792,8 +756,17 @@ document.addEventListener('DOMContentLoaded', () => {
 function rbForwardControlToAgent(cmd) {
   const allow = document.getElementById('allowControl')?.checked;
   if (!allow) return; // host has not granted control permission
-  if (!agentConnected || !agentSocket || agentSocket.readyState !== WebSocket.OPEN) return;
-  agentSocket.send(JSON.stringify(cmd));
+  if (!agentConnected || !agentSocket || agentSocket.readyState !== WebSocket.OPEN) {
+    // Do not spam the log for every mousemove. The status badge already shows
+    // the actual agent state; one warning is enough for a disconnected host.
+    if (!rbForwardControlToAgent.warned) {
+      rbForwardControlToAgent.warned = true;
+      rbLog('Remote control is enabled, but the native control agent is not connected. Start the agent and click Connect.');
+    }
+    return;
+  }
+  rbForwardControlToAgent.warned = false;
+  try { agentSocket.send(JSON.stringify(cmd)); } catch (_) {}
 }
 
 /* ------------------------- Remote console (host side) ------------------------- */
@@ -914,6 +887,19 @@ function rbRenderConnectedViewers() {
 }
 
 async function rbAcceptSession(sessionId, initiatorId, deviceInfo) {
+  // Chrome/Edge require screen capture to run in a secure context. localhost
+  // is allowed, but an ordinary http://192.168.x.x page is not. Give the host
+  // a precise message instead of silently leaving the request pending.
+  if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1' && location.hostname !== '::1') {
+    rbLog('Remote access cannot start from an insecure HTTP page. Open this host page over HTTPS (or localhost for local testing).');
+    alert('Remote access needs HTTPS on the host computer. Open RemoteBridge over https://, or use http://localhost when the host and server are the same computer.');
+    return;
+  }
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+    rbLog('This browser does not provide screen capture. Use a current Chrome or Edge browser.');
+    alert('Screen capture is unavailable in this browser. Please use current Chrome or Edge.');
+    return;
+  }
   try {
     hostStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
   } catch (e) {

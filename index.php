@@ -1,33 +1,51 @@
 <?php
 declare(strict_types=1);
 
-// Needed so the "Devices on this network" access-control gate can remember
-// that a browser tab unlocked it, across the polling requests it makes.
-// Keep the session cookie inaccessible to JavaScript and scoped to same-site
-// requests. Secure is enabled automatically when HTTPS is used.
-if (session_status() !== PHP_SESSION_ACTIVE) {
-    $https = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
-        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
-    session_set_cookie_params([
-        'httponly' => true,
-        'secure' => $https,
-        'samesite' => 'Lax',
-        'path' => '/',
-    ]);
-    session_start();
-}
-
 require __DIR__ . '/database.php';
 $config = require __DIR__ . '/config.php';
 
 // Main/default application entry point. API requests are kept in this file
 // so the project can be deployed with Apache/Nginx without a separate router.
 $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-$scriptDir = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/'));
-$basePath = ($scriptDir === '/' || $scriptDir === '.') ? '' : rtrim($scriptDir, '/');
-$path = $requestPath;
-if ($basePath !== '' && str_starts_with($path, $basePath)) {
-    $path = substr($path, strlen($basePath)) ?: '/';
+
+/* Determine the installation base path (e.g. "/A-RemoteVanced" when this
+ * project lives in htdocs/A-RemoteVanced) directly from the request URL,
+ * instead of from $_SERVER['SCRIPT_NAME'].
+ *
+ * SCRIPT_NAME is NOT reliable here: under the .htaccess rule
+ * "RewriteRule ^ index.php", different Apache/PHP builds report SCRIPT_NAME
+ * as either the physical script path or the pre-rewrite request path, and
+ * which one you get can differ between the initial page load and later
+ * /api/* calls. That mismatch broke basePath stripping for every request
+ * the same way, so every route — network scan, Remote ID registration, and
+ * the control agent alike — fell through to the 404 handler at once.
+ *
+ * The request URL itself is always accurate, so locate this app's own
+ * known route markers inside it and split there. */
+$routeMarkers = ['/index.php/', '/index.php', '/health', '/api/'];
+$path = null;
+$basePath = '';
+foreach ($routeMarkers as $marker) {
+    $pos = strpos($requestPath, $marker);
+    if ($pos !== false) {
+        $basePath = rtrim(substr($requestPath, 0, $pos), '/');
+        $path = substr($requestPath, $pos);
+        break;
+    }
+}
+if ($path === null) {
+    // No known route marker present: this is a request for the app shell
+    // itself, e.g. "/" or "/A-RemoteVanced/".
+    $basePath = rtrim($requestPath, '/');
+    $path = '/';
+}
+// Apache/Nginx installations sometimes pass PATH_INFO as /index.php/<route>
+// instead of rewriting directly to /<route>. Normalize both forms so API
+// routes such as /api/network/scan cannot fall through to the HTML 404.
+if ($path === '/index.php') {
+    $path = '/';
+} elseif (str_starts_with($path, '/index.php/')) {
+    $path = substr($path, strlen('/index.php')) ?: '/';
 }
 if ($path[0] !== '/') $path = '/' . $path;
 
@@ -74,6 +92,27 @@ function rb_require_local(): void {
     }
 }
 
+/** Network discovery is safe to expose to a browser on the same LAN as the
+ * PHP server, because the scan is still executed by this server. It must not
+ * be opened to arbitrary internet clients. */
+function rb_require_same_lan(): void {
+    $client = rb_client_ip();
+    if (in_array($client, ['127.0.0.1', '::1'], true)) return;
+    if (!filter_var($client, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        rb_json(['error' => 'Network scan is available only from the local LAN'], 403);
+    }
+    $network = rb_local_network();
+    if (!$network || !filter_var($network['first'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        rb_json(['error' => 'Could not determine the server LAN'], 500);
+    }
+    $ipLong = ip2long($client);
+    $networkLong = ip2long($network['network']);
+    $maskLong = ip2long($network['mask']);
+    if ($ipLong === false || $networkLong === false || $maskLong === false || (($ipLong & $maskLong) !== ($networkLong & $maskLong))) {
+        rb_json(['error' => 'Network scan is available only to clients on the same LAN as this server'], 403);
+    }
+}
+
 function rb_pid_alive(int $pid): bool {
     if ($pid <= 0) return false;
     if (stripos(PHP_OS, 'WIN') === 0) {
@@ -83,45 +122,22 @@ function rb_pid_alive(int $pid): bool {
     return posix_kill($pid, 0);
 }
 
-/** Access code for the network-devices sidebar: an explicit env-configured
- * one, or a random one generated on first use and saved locally — same
- * pattern as the control agent's .token file, so it's only ever readable
- * by whoever already has filesystem access to this machine. */
-function rb_network_access_code(array $config): string {
-    // Admin/settings.php is the preferred configuration source. The DB value
-    // overrides config.php/env so administrators do not need to edit source
-    // files when changing the network-panel access code.
-    try {
-        $db = db();
-        $db->query("CREATE TABLE IF NOT EXISTS app_settings (
-            setting_key VARCHAR(100) NOT NULL PRIMARY KEY,
-            setting_value TEXT NULL,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-        $stmt = $db->prepare('SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1');
-        $key = 'network_access_code';
-        $stmt->bind_param('s', $key);
-        $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-        if (is_array($row) && !empty($row['setting_value'])) return (string)$row['setting_value'];
-    } catch (Throwable $e) {
-        // Fall through to legacy config/file storage if the DB is not ready.
-    }
-
-    $configured = $config['network']['access_code'] ?? null;
-    if (!empty($configured)) return (string)$configured;
-
-    $tokenFile = __DIR__ . '/data/network-sidebar.token';
-    if (is_file($tokenFile)) {
-        $existing = trim((string)file_get_contents($tokenFile));
-        if ($existing !== '') return $existing;
-    }
-    if (!is_dir(dirname($tokenFile))) @mkdir(dirname($tokenFile), 0700, true);
-    $code = bin2hex(random_bytes(4)); // short — someone has to type this in
-    @file_put_contents($tokenFile, $code);
-    @chmod($tokenFile, 0600);
-    return $code;
+/** Whether something is actually listening on the agent's host:port.
+ *
+ * A PID existing (rb_pid_alive) is NOT proof the agent is actually up: on
+ * Windows in particular, PIDs get recycled quickly, so a stale
+ * agent-run.pid left over from a previous run (crash, reboot, `taskkill`
+ * outside the app, etc.) can point at a completely unrelated process that
+ * now happens to reuse the same PID. When that happens, /api/agent/start
+ * previously trusted the stale PID, reported "already_running": true, and
+ * never actually launched a new agent — so the page's "Start" button says
+ * Running while nothing is listening on 8791 and Connect always fails.
+ * Checking the port directly is the only reliable signal. */
+function rb_port_open(string $host, int $port, float $timeoutSec = 0.35): bool {
+    $target = ($host === '0.0.0.0' || $host === '' || $host === '::') ? '127.0.0.1' : $host;
+    $conn = @stream_socket_client('tcp://' . $target . ':' . $port, $errno, $errstr, $timeoutSec);
+    if ($conn) { fclose($conn); return true; }
+    return false;
 }
 
 /* ---------------------------------------------------------------------
@@ -288,11 +304,9 @@ if ($path === '/api/offline' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
 /** Looks up the device name + last-seen for a Remote ID, so each side of a
  * session (or an incoming request) can show what device the other party is
- * using, not just their numeric ID. When the requester's browser has the
- * Devices sidebar unlocked, this also cross-references the device's stored
- * IP against this server's own ARP cache — if it shows up there (i.e. it's
- * genuinely on the same local network as this server), its MAC address is
- * included too. Off-LAN / internet peers simply won't have a MAC. */
+ * using, not just their numeric ID. Local peers are cross-referenced against
+ * this server's ARP cache so a same-LAN device can expose its MAC address.
+ * Off-LAN / internet peers simply won't have a MAC. */
 if ($path === '/api/device/lookup' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     $remoteId = rb_clean_id((string)($_GET['remote_id'] ?? ''));
     if ($remoteId === '') rb_json(['error' => 'remote_id required'], 400);
@@ -305,7 +319,7 @@ if ($path === '/api/device/lookup' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 
     $mac = null;
     $onLocalNetwork = false;
-    if (!empty($_SESSION['network_unlocked']) && !empty($row['ip_address'])) {
+    if (!empty($row['ip_address'])) {
         foreach (rb_arp_table() as $arpEntry) {
             if ($arpEntry['ip'] === $row['ip_address']) {
                 $mac = $arpEntry['mac'];
@@ -482,11 +496,21 @@ $rbAgentIsWindows = stripos(PHP_OS, 'WIN') === 0;
 if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     rb_require_local();
 
+    $agentConfigPre = $config['agent'] ?? [];
+    $preHost = (string)($agentConfigPre['host'] ?? '127.0.0.1');
+    $prePort = (int)($agentConfigPre['port'] ?? 8791);
+
     if (is_file($rbAgentPidFile)) {
         $existingPid = (int)trim((string)file_get_contents($rbAgentPidFile));
-        if (rb_pid_alive($existingPid)) {
+        // Require BOTH a live PID and an actually-listening port. A PID alone
+        // is not trustworthy (see rb_port_open() above) — trusting it here
+        // is what previously made the UI report "already running" for an
+        // agent that was not actually reachable.
+        if (rb_pid_alive($existingPid) && rb_port_open($preHost, $prePort)) {
             rb_json(['ok' => true, 'already_running' => true, 'pid' => $existingPid]);
         }
+        // Stale/incorrect PID file — remove it and fall through to start fresh.
+        @unlink($rbAgentPidFile);
     }
 
     if (!is_dir($rbAgentDir)) rb_json(['error' => 'agent/ directory not found'], 500);
@@ -498,12 +522,18 @@ if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $agentPort = (int)($agentConfig['port'] ?? 8791);
 
     if ($rbAgentIsWindows) {
-        // /B keeps it attached to this proc_open call (so proc_get_status
-        // reports it) without opening a separate console window.
+        // cmd.exe does not treat single quotes as path quoting. The previous
+        // launcher therefore failed on common XAMPP paths such as C:\xampp\htdocs.
         $safeHost = preg_replace('/[^A-Za-z0-9_.:\-]/', '', $agentHost) ?: '127.0.0.1';
-        $cmd = 'cmd /V:ON /C "set RB_AGENT_HOST=' . $safeHost . '&& set RB_AGENT_PORT=' . $agentPort . '&& cd /d ' . escapeshellarg($rbAgentDir)
-             . ' && npm install 1>>' . escapeshellarg($rbAgentLog) . ' 2>&1'
-             . ' && node control-agent.js 1>>' . escapeshellarg($rbAgentLog) . ' 2>&1"';
+        $agentDirCmd = '"' . str_replace('"', '', $rbAgentDir) . '"';
+        $agentLogCmd = '"' . str_replace('"', '', $rbAgentLog) . '"';
+        // Do not wrap the whole /C command in another pair of quotes: nested
+        // quoted Windows paths would otherwise terminate cmd.exe's command
+        // string early. The paths themselves remain quoted.
+        $cmd = 'cmd.exe /D /C set RB_AGENT_HOST=' . $safeHost . '&& set RB_AGENT_PORT=' . $agentPort
+             . '&& cd /d ' . $agentDirCmd
+             . ' && if exist node_modules\.bin\node.cmd (node control-agent.js) else (npm install --no-audit --no-fund && node control-agent.js)'
+             . ' 1>>' . $agentLogCmd . ' 2>&1';
     } else {
         // exec replaces the shell with node once npm install finishes, so the
         // PID we capture below stays valid for the whole lifetime of the agent.
@@ -534,7 +564,14 @@ if ($path === '/api/agent/output' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 
     $running = false;
     if (is_file($rbAgentPidFile)) {
-        $running = rb_pid_alive((int)trim((string)file_get_contents($rbAgentPidFile)));
+        $agentConfigOut = $config['agent'] ?? [];
+        $outHost = (string)($agentConfigOut['host'] ?? '127.0.0.1');
+        $outPort = (int)($agentConfigOut['port'] ?? 8791);
+        $pidFromFile = (int)trim((string)file_get_contents($rbAgentPidFile));
+        // Same reasoning as /api/agent/start: only trust the PID once the
+        // port is confirmed listening, otherwise a stale/reused PID makes
+        // the console falsely claim the agent is still running.
+        $running = rb_pid_alive($pidFromFile) && rb_port_open($outHost, $outPort);
     }
 
     $chunk = '';
@@ -581,24 +618,29 @@ function rb_mac_looks_valid(string $mac): bool {
     return (bool)preg_match('/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i', $mac) && strtolower($mac) !== '00:00:00:00:00:00';
 }
 
-/** Best-effort device-name lookup. Network discovery can reliably provide an
- * IP and MAC from ARP, but a human/device name is only available when the LAN
- * exposes DNS/NetBIOS information. Prefer reverse DNS and keep the lookup
- * non-fatal so one unavailable hostname never blocks the whole device list. */
-function rb_resolve_device_name(string $ip): ?string {
-    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return null;
-    $host = @gethostbyaddr($ip);
-    if ($host && $host !== $ip && preg_match('/^[a-zA-Z0-9._-]+$/', $host)) {
-        return $host;
-    }
-    return null;
-}
-
+/** Hostname lookups are intentionally not performed during a scan. Reverse DNS
+ * can block for many seconds on a LAN with no DNS server, making discovery
+ * appear to freeze. Device names are therefore taken from native ARP/NetBIOS
+ * output when the OS provides them; otherwise the UI uses the IP address. */
 function rb_arp_table(): array {
     $devices = [];
     $isWindows = stripos(PHP_OS, 'WIN') === 0;
 
     if ($isWindows) {
+        // Windows 10/11 keeps a richer neighbor table than `arp -a`, including
+        // entries that are stale/reachable but not printed in the legacy ARP
+        // format. Read both sources and merge them.
+        $ps = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.AddressFamily -eq 2 -and $_.LinkLayerAddress} | ForEach-Object {$_.IPAddress + [char]124 + $_.LinkLayerAddress + [char]124 + $_.State}" 2>NUL';
+        $neighborOut = (string)shell_exec($ps);
+        foreach (explode("\n", $neighborOut) as $line) {
+            $parts = array_map('trim', explode('|', trim($line)));
+            if (count($parts) < 2) continue;
+            $ip = $parts[0];
+            $mac = strtolower(str_replace('-', ':', $parts[1]));
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || !rb_mac_looks_valid($mac)) continue;
+            $devices[$ip] = ['ip' => $ip, 'mac' => $mac, 'type' => strtolower($parts[2] ?? '') === 'static' ? 'static' : 'dynamic'];
+        }
+
         $out = shell_exec('arp -a 2>NUL') ?: '';
         foreach (explode("\n", $out) as $line) {
             if (preg_match('/^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F-]{17})\s+(\S+)/', $line, $m)) {
@@ -632,10 +674,7 @@ function rb_arp_table(): array {
     $list = array_values($devices);
     foreach ($list as &$entry) {
         if (empty($entry['hostname'])) {
-            $entry['hostname'] = rb_resolve_device_name((string)$entry['ip']);
-        }
-        if (empty($entry['hostname'])) {
-            $entry['hostname'] = 'Unknown device';
+            $entry['hostname'] = 'Device ' . (string)$entry['ip'];
         }
     }
     unset($entry);
@@ -654,60 +693,121 @@ function rb_server_lan_ipv4(): ?string {
         return $server;
     }
 
+    // Prefer the interface that owns the default route. This avoids selecting
+    // VMware/VirtualBox/VPN adapters before the real Wi-Fi/Ethernet adapter.
     if (stripos(PHP_OS, 'WIN') === 0) {
+        $ps = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+            . '"$c=Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -and $_.IPv4Address}; '
+            . '$c | ForEach-Object {$_.IPv4Address | ForEach-Object {$_.IPAddress}}" 2>NUL';
+        $out = (string)shell_exec($ps);
+        foreach (preg_split('/\R/', trim($out)) ?: [] as $candidate) {
+            $candidate = trim($candidate);
+            if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($candidate, '127.')) return $candidate;
+        }
+
+        // Older Windows/PowerShell installations may not expose
+        // Get-NetIPConfiguration; keep ipconfig as a fallback.
         $out = (string)shell_exec('ipconfig 2>NUL');
         if (preg_match_all('/IPv4 Address[^:]*:\s*([0-9.]+)/i', $out, $m)) {
-            foreach ($m[1] as $ip) {
-                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
-                    && !str_starts_with($ip, '127.')) return $ip;
+            foreach ($m[1] as $candidate) {
+                if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                    && !str_starts_with($candidate, '127.')) return $candidate;
             }
         }
     } else {
+        // Linux: ask the kernel which source address it would use for an
+        // external route, which is a reliable way to select the active LAN NIC.
+        $out = trim((string)shell_exec('ip -4 route get 1.1.1.1 2>/dev/null'));
+        if (preg_match('/\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b/', $out, $m)) {
+            if (filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($m[1], '127.')) return $m[1];
+        }
         $out = trim((string)shell_exec('hostname -I 2>/dev/null'));
-        foreach (preg_split('/\s+/', $out) ?: [] as $ip) {
-            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
-                && !str_starts_with($ip, '127.')) return $ip;
+        foreach (preg_split('/\s+/', $out) ?: [] as $candidate) {
+            if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($candidate, '127.')) return $candidate;
         }
     }
     return null;
 }
 
-/** Best-effort /24 subnet prefix used by the network scan. */
-function rb_local_subnet_prefix(): ?string {
+/** Determine the LAN network used by discovery. We prefer the real
+ * interface netmask/prefix and fall back to the common /24 LAN layout. */
+function rb_local_network(): ?array {
     $ip = rb_server_lan_ipv4();
-    if (!$ip || !preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/', $ip, $m)) return null;
-    return $m[1];
-}
+    if (!$ip) return null;
 
-if ($path === '/api/network/status') {
-    rb_require_local();
-    rb_json(['unlocked' => !empty($_SESSION['network_unlocked'])]);
-}
+    $prefixLength = null;
+    if (stripos(PHP_OS, 'WIN') === 0) {
+        // Ask Windows directly for the prefix attached to the selected IP.
+        $safeIp = escapeshellarg($ip);
+        $ps = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+            . '"$x=Get-NetIPAddress -AddressFamily IPv4 -IPAddress ' . $safeIp . ' -ErrorAction SilentlyContinue; '
+            . 'if($x){$x.PrefixLength}" 2>NUL';
+        $prefixOut = trim((string)shell_exec($ps));
+        if (preg_match('/\b(\d{1,2})\b/', $prefixOut, $m)) {
+            $candidate = (int)$m[1];
+            if ($candidate >= 1 && $candidate <= 30) $prefixLength = $candidate;
+        }
 
-if ($path === '/api/network/unlock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    rb_require_local();
-    $body = rb_body();
-    $submitted = (string)($body['code'] ?? '');
-    $expected = rb_network_access_code($config);
-    if ($submitted === '' || !hash_equals($expected, $submitted)) {
-        rb_json(['ok' => false, 'error' => 'Incorrect code'], 403);
+        // Fallback for older Windows versions.
+        if ($prefixLength === null) {
+            $out = (string)shell_exec('ipconfig 2>NUL');
+            $lines = preg_split('/\R/', $out) ?: [];
+            $candidateIp = false;
+            foreach ($lines as $line) {
+                if (preg_match('/IPv4 Address[^:]*:\s*([0-9.]+)/i', $line, $m)) {
+                    $candidateIp = $m[1] === $ip;
+                    continue;
+                }
+                if ($candidateIp && preg_match('/Subnet Mask[^:]*:\s*([0-9.]+)/i', $line, $m)) {
+                    $mask = $m[1];
+                    $bits = 0;
+                    foreach (explode('.', $mask) as $octet) $bits += substr_count(decbin((int)$octet), '1');
+                    if ($bits >= 1 && $bits <= 30) { $prefixLength = $bits; break; }
+                }
+            }
+        }
+    } else {
+        $out = (string)shell_exec('ip -4 addr show 2>/dev/null');
+        if (preg_match_all('/inet\s+(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})\s+/m', $out, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) {
+                if ($row[1] === $ip) { $prefixLength = (int)$row[2]; break; }
+            }
+        }
     }
-    if (session_status() === PHP_SESSION_ACTIVE) {
-        session_regenerate_id(true);
-    }
-    $_SESSION['network_unlocked'] = true;
-    rb_json(['ok' => true]);
-}
+    if ($prefixLength === null) $prefixLength = 24;
 
-if ($path === '/api/network/lock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    rb_require_local();
-    unset($_SESSION['network_unlocked']);
-    rb_json(['ok' => true]);
+    $ipLong = ip2long($ip);
+    if ($ipLong === false) return null;
+    $mask = $prefixLength === 0 ? 0 : ((-1 << (32 - $prefixLength)) & 0xffffffff);
+    $networkLong = $ipLong & $mask;
+    $broadcastLong = $networkLong | (~$mask & 0xffffffff);
+    $first = $networkLong + 1;
+    $last = $broadcastLong - 1;
+    if ($prefixLength >= 31) { $first = $networkLong; $last = $broadcastLong; }
+
+    $hostCount = max(1, $last - $first + 1);
+    // A /16 or larger can contain tens of thousands of addresses. Keep the
+    // web request bounded, while still scanning a useful 4094-host window.
+    if ($hostCount > 4094) $last = $first + 4093;
+
+    return [
+        'ip' => $ip,
+        'prefix' => $prefixLength,
+        'network' => long2ip($networkLong),
+        'broadcast' => long2ip($broadcastLong),
+        'first' => long2ip($first),
+        'last' => long2ip($last),
+        'mask' => long2ip($mask),
+        'cidr' => long2ip($networkLong) . '/' . $prefixLength,
+        'host_count' => $hostCount,
+    ];
 }
 
 if ($path === '/api/network/devices' && $_SERVER['REQUEST_METHOD'] === 'GET') {
-    rb_require_local();
-    if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
+    rb_require_same_lan();
     $devices = rb_arp_table();
     rb_json(['devices' => $devices, 'count' => count($devices)]);
 }
@@ -732,9 +832,7 @@ function rb_is_local_user_ip(?string $ip): bool {
 }
 
 if ($path === '/api/network/users' && $_SERVER['REQUEST_METHOD'] === 'GET') {
-    rb_require_local();
-    if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
-
+    rb_require_same_lan();
     // This endpoint intentionally represents BOTH the network devices visible
     // to the server and the RemoteBridge users currently online on the same LAN.
     // ARP is not a complete list by itself: phones, Wi-Fi clients, VPN clients,
@@ -864,48 +962,64 @@ function rb_run_bounded_process(string $command, int $timeoutMs = 5000): array {
 }
 
 if ($path === '/api/network/scan' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    rb_require_local();
-    if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
+    rb_require_same_lan();
 
-    $prefix = rb_local_subnet_prefix();
-    if (!$prefix) rb_json(['error' => 'Could not determine the local subnet to scan'], 500);
+    $network = rb_local_network();
+    if (!$network) rb_json(['error' => 'Could not determine the local network to scan'], 500);
 
     $isWindows = stripos(PHP_OS, 'WIN') === 0;
-    $scanTimeoutMs = 6000;
+    // The helper probes the complete detected host range. Keep the HTTP job
+    // bounded so discovery cannot hang or interfere with the rest of the app.
+    $scanTimeoutMs = 15000;
     $result = ['ok' => false, 'timed_out' => false];
 
     if ($isWindows) {
         $script = __DIR__ . DIRECTORY_SEPARATOR . 'agent' . DIRECTORY_SEPARATOR . 'network-scan.ps1';
         if (!is_readable($script)) rb_json(['error' => 'Network scan helper is missing'], 500);
-
-        // PowerShell is a child of this request and is forcibly terminated if
-        // it exceeds the hard timeout. It is never started with start /B.
-        $cmd = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
-             . escapeshellarg($script) . ' -Prefix ' . escapeshellarg($prefix);
+        $cmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
+             . escapeshellarg($script)
+             . ' -First ' . escapeshellarg($network['first'])
+             . ' -Last ' . escapeshellarg($network['last']);
         $result = rb_run_bounded_process($cmd, $scanTimeoutMs);
     } else {
         $script = __DIR__ . DIRECTORY_SEPARATOR . 'agent' . DIRECTORY_SEPARATOR . 'network-scan.sh';
-        if (is_readable($script)) {
-            $cmd = 'sh ' . escapeshellarg($script) . ' ' . escapeshellarg($prefix);
-            $result = rb_run_bounded_process($cmd, $scanTimeoutMs);
-        } else {
-            rb_json(['error' => 'Network scan helper is missing'], 500);
-        }
+        if (!is_readable($script)) rb_json(['error' => 'Network scan helper is missing'], 500);
+        $cmd = 'sh ' . escapeshellarg($script)
+             . ' ' . escapeshellarg($network['first'])
+             . ' ' . escapeshellarg($network['last']);
+        $result = rb_run_bounded_process($cmd, $scanTimeoutMs);
     }
 
-    // A timeout is a bounded scan completion, not a server failure. ARP may
-    // still contain partial results and those are returned to the UI.
+    // ARP contains the layer-2 neighbors learned by the host. The sweep above
+    // refreshes it across the detected subnet, then the API returns the current
+    // valid IPv4/MAC entries. Do not report a failed helper process as a
+    // successful scan: that made the UI look like discovery worked when the
+    // PHP/Windows host could not execute the scanner.
     $devices = rb_arp_table();
+    if (!$result['ok'] && !$result['timed_out']) {
+        $detail = trim((string)($result['stderr'] ?? ''));
+        if ($detail === '') $detail = 'The network scan helper could not be executed by PHP.';
+        rb_json([
+            'ok' => false,
+            'subnet' => $network['cidr'],
+            'host_range' => $network['first'] . ' - ' . $network['last'],
+            'devices' => $devices,
+            'count' => count($devices),
+            'error' => $detail,
+        ], 500);
+    }
+
     rb_json([
         'ok' => true,
         'started' => true,
         'completed' => !$result['timed_out'],
         'timed_out' => $result['timed_out'],
-        'subnet' => $prefix . '.0/24',
+        'subnet' => $network['cidr'],
+        'host_range' => $network['first'] . ' - ' . $network['last'],
         'devices' => $devices,
         'count' => count($devices),
         'message' => $result['timed_out']
-            ? 'Network scan stopped at the safety timeout; partial results are shown.'
+            ? 'The scan reached its time limit; devices discovered so far are shown.'
             : 'Network scan completed.'
     ]);
 }
@@ -1124,7 +1238,7 @@ main{max-width:900px;margin:0 auto;width:100%}
           <li><strong>Start the server.</strong> <code>php -S 0.0.0.0:8080 index.php</code>, then open <code>http://127.0.0.1:8080/</code>. Running under XAMPP/Apache in a subfolder works too — the frontend detects the install path automatically.</li>
           <li><strong>Set up TURN for internet use (optional).</strong> A free shared TURN relay (Open Relay Project) is used automatically with zero setup. For production or heavy use, set <code>RB_TURN_URL</code>, <code>RB_TURN_USERNAME</code>, and <code>RB_TURN_CREDENTIAL</code> in <code>config.php</code>, or set <code>RB_DISABLE_FREE_TURN=1</code> to turn the free fallback off.</li>
           <li><strong>Enable remote control (optional).</strong> On the host side, under the "Share my screen" tab → "Native control agent", click <strong>Run server</strong> (or run <code>cd agent && npm install && node control-agent.js</code> yourself), paste the token it prints, and click Connect. Only do this for someone you trust — once granted, control stays active until you uncheck it.</li>
-          <li><strong>Unlock the Devices sidebar (optional).</strong> The right-hand "Devices on this network" panel is protected by the Network Access Code. Configure or regenerate it from <code>admin/settings.php</code>; legacy <code>config.php</code>/<code>RB_NETWORK_ACCESS_CODE</code> values remain supported as a fallback.</li>
+          <li><strong>Scan the local network.</strong> The "Devices on this network" panel can scan the detected LAN subnet directly. No access code is required.</li>
         </ol>
       </div>
     </div>
@@ -1288,22 +1402,12 @@ Click "Run server" to start — output streams here.
 <aside class="sidebar sidebar-right">
   <div class="card">
     <h2>Devices on this network</h2>
-    <p class="muted" style="font-size:12.5px">Read from this server's own ARP cache — only devices it has recently talked to on the LAN. Local machine only.</p>
+    <p class="muted" style="font-size:12.5px">Scan the complete detected local subnet from this server. Active devices are discovered through ICMP/ARP and displayed with their IP, MAC, and hostname when available.</p>
 
-    <div id="deviceLocked">
-      <p class="muted" style="font-size:12.5px;margin-top:10px">Locked. Enter the Network Access Code configured in <a href="<?= htmlspecialchars($basePath . '/admin/settings.php', ENT_QUOTES) ?>" style="color:#9ec5ff">Admin settings</a>. Legacy <code>config.php</code>/<code>RB_NETWORK_ACCESS_CODE</code> values are used only as a fallback.</p>
-      <div class="row" style="margin-top:8px">
-        <input type="text" id="networkAccessCode" placeholder="Access code">
-        <button onclick="rbUnlockDevices()">Unlock</button>
-      </div>
-      <p id="networkUnlockError" class="muted hidden" style="margin-top:6px;color:#f2c58a"></p>
-    </div>
-
-    <div id="deviceUnlocked" class="hidden">
+    <div id="deviceUnlocked">
       <div class="row" style="margin-top:10px">
-        <button id="btnScanDevices" class="secondary" onclick="rbScanDevices()">Scan network</button>
+        <button id="btnScanDevices" class="secondary" onclick="rbScanDevices()">Scan all devices</button>
         <button class="secondary" onclick="rbLoadDevices()">Refresh</button>
-        <button class="secondary" onclick="rbLockDevices()">Lock</button>
       </div>
       <div id="deviceCount" class="muted" style="margin-top:8px;font-size:12.5px"></div>
       <div id="deviceGrid" class="device-grid"><div class="device-empty">Loading…</div></div>
@@ -1341,6 +1445,6 @@ function rbShowTab(which){
   document.getElementById('panelViewer').classList.toggle('hidden', which!=='viewer');
 }
 </script>
-<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260821-remote-console"></script>
+<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260823-remote-fix"></script>
 </body>
 </html>

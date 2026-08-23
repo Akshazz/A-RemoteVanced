@@ -15,7 +15,7 @@ declare(strict_types=1);
 return [
     'app' => [
         'name' => 'RemoteBridge',
-        'version' => '2.1.0',
+        'version' => '2.2.2',
     ],
 
     /* ================================================================
@@ -51,8 +51,4 @@ return [
         'use_free_fallback' => !getenv('RB_DISABLE_FREE_TURN'),
     ],
 
-    // Access control for the "Devices on this network" sidebar.
-    'network' => [
-        'access_code' => getenv('RB_NETWORK_ACCESS_CODE') ?: null,
-    ],
 ];
