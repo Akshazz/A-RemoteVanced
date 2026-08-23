@@ -10,6 +10,10 @@ Options -Indexes
     Require all denied
 </FilesMatch>
 
+# includes/ holds shared PHP bootstrap code, not a routable page — it should
+# only ever be reached via require from index.php/login.php, never directly.
+RedirectMatch 404 ^/includes/
+
 RedirectMatch 404 ^/data/
 
 RewriteEngine On

@@ -48,6 +48,46 @@ viewer all stop the remote shell. Console output/input travels over its own reli
 WebRTC data channel, separate from the low-latency/unreliable one used for mouse
 movement, so typed commands and their output can't be silently dropped.
 
+## Login (required)
+
+The app now requires a login before it does anything — registering a device,
+starting a session, or scanning the network. Two accounts already exist in
+`database/remote_bridge.sql`: **sadmin** (admin) and **sadmin1** (user), but
+their passwords are unknown bcrypt hashes from the original dump. Set real
+passwords for them before first use:
+
+```bash
+php -r "echo password_hash('choose-a-strong-password', PASSWORD_BCRYPT), PHP_EOL;"
+```
+
+Then update the database with the hash it prints:
+
+```sql
+UPDATE users SET password_hash = '<hash from above>' WHERE username = 'sadmin';
+UPDATE users SET password_hash = '<hash from above>' WHERE username = 'sadmin1';
+```
+
+To add more accounts later, insert into `users` the same way (`role` is
+`admin` or `user`).
+
+**What logging in changes:**
+- Every device/session/signaling endpoint now requires a logged-in user
+  (`/api/register`, `/api/heartbeat`, `/api/session/*`, the native agent
+  start/stop/output endpoints).
+- Network discovery (`/api/network/devices`, `/api/network/users`,
+  `/api/network/scan`) and `admin/settings.php` are restricted to the
+  `admin` role, on top of the existing same-machine/same-LAN checks.
+- Logins, logouts, and network scans are written to `audit_log`.
+- Login attempts are rate-limited (8 tries per IP+username per 5 minutes).
+
+This is a "quick fix" tier of auth — session-based, no device-ownership
+enforcement beyond the `user_id` column, no MFA/password-reset flow. Treat
+it as enough for a trusted LAN, not as production-grade for internet
+exposure. See `review/RBAC_IMPLEMENTATION_GUIDE.md` and
+`review/CODE_REVIEW_RBAC.md` for what a fuller implementation (per-device
+ownership checks, MFA, password reset, dedicated session/rate-limit tables)
+would add.
+
 ## Notes
 - Runtime agent tokens and `node_modules` are intentionally not packaged.
 - `.htaccess` blocks runtime secrets/configuration files and SQL/log/backup files from HTTP access.

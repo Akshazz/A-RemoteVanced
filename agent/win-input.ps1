@@ -8,7 +8,7 @@ using System;
 using System.Runtime.InteropServices;
 public class Win32Input {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
 }
@@ -53,7 +53,6 @@ while ($true) {
     if ($line.Trim().Length -eq 0) { continue }
     try { $cmd = $line | ConvertFrom-Json } catch { continue }
 
-    try {
     switch ($cmd.type) {
         'move' {
             $x = [Math]::Min($screenW - 1, [Math]::Max(0, [int]($cmd.x * $screenW)))
@@ -73,15 +72,8 @@ while ($true) {
             [Win32Input]::mouse_event([uint32]$flag, 0, 0, 0, [UIntPtr]::Zero)
         }
         'wheel' {
-            # deltaY (and therefore $delta) is routinely negative — e.g. scrolling
-            # down sends a positive deltaY, so -1*deltaY goes negative. mouse_event's
-            # dwData is declared as `int` above (not `uint`) specifically so this
-            # signed value marshals straight through; casting a negative number to
-            # [uint32] here throws ("Cannot convert value '-111' to type
-            # 'System.UInt32'") on every downward scroll and was silently breaking
-            # the wheel input on every session.
             $delta = [int](-1 * $cmd.deltaY)
-            [Win32Input]::mouse_event([uint32]$MOUSEEVENTF_WHEEL, 0, 0, $delta, [UIntPtr]::Zero)
+            [Win32Input]::mouse_event([uint32]$MOUSEEVENTF_WHEEL, 0, 0, [uint32]$delta, [UIntPtr]::Zero)
         }
         'key' {
             $vk = Get-VkCode $cmd.key
@@ -90,10 +82,5 @@ while ($true) {
                 [Win32Input]::keybd_event([byte]$vk, 0, [uint32]$flag, [UIntPtr]::Zero)
             }
         }
-    }
-    } catch {
-        # Never let one malformed/unexpected command kill the whole input
-        # backend — log it and keep reading the next line.
-        [Console]::Error.WriteLine("Ignored bad input command: $($_.Exception.Message)")
     }
 }
