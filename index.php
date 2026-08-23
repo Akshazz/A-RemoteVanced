@@ -1,46 +1,21 @@
 <?php
 declare(strict_types=1);
 
-// Needed so the "Devices on this network" access-control gate can remember
-// that a browser tab unlocked it, across the polling requests it makes.
-// Keep the session cookie inaccessible to JavaScript and scoped to same-site
-// requests. Secure is enabled automatically when HTTPS is used.
-if (session_status() !== PHP_SESSION_ACTIVE) {
-    $https = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
-        || ((int)($_SERVER['SERVER_PORT'] ?? 0) === 443);
-    session_set_cookie_params([
-        'httponly' => true,
-        'secure' => $https,
-        'samesite' => 'Lax',
-        'path' => '/',
-    ]);
-    session_start();
-}
-
-require __DIR__ . '/database.php';
-$config = require __DIR__ . '/config.php';
+require __DIR__ . '/includes/bootstrap.php';
 
 // Main/default application entry point. API requests are kept in this file
 // so the project can be deployed with Apache/Nginx without a separate router.
 $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-$scriptDir = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/'));
-$basePath = ($scriptDir === '/' || $scriptDir === '.') ? '' : rtrim($scriptDir, '/');
-$path = $requestPath;
-if ($basePath !== '' && str_starts_with($path, $basePath)) {
-    $path = substr($path, strlen($basePath)) ?: '/';
-}
-if ($path[0] !== '/') $path = '/' . $path;
+[$path, $basePath] = rb_resolve_route($requestPath);
 
 /* ---------------------------------------------------------------------
  * Small helpers
+ *
+ * Auth, session, and rate-limit helpers (rb_json, rb_client_ip,
+ * rb_audit_log, rb_get_current_user, rb_require_auth, rb_require_admin,
+ * rb_attempt_login, ...) live in includes/bootstrap.php, shared with
+ * login.php. Everything below is specific to routing requests in this file.
  * ------------------------------------------------------------------- */
-
-function rb_json(array $data, int $code = 200): never {
-    http_response_code($code);
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode($data, JSON_UNESCAPED_SLASHES);
-    exit;
-}
 
 function rb_body(): array {
     $raw = file_get_contents('php://input') ?: '';
@@ -61,16 +36,33 @@ function rb_valid_remote_id(string $id): bool {
     return (bool)preg_match('/^\d{9}$/', $id);
 }
 
-function rb_client_ip(): ?string {
-    return $_SERVER['REMOTE_ADDR'] ?? null;
-}
-
 /** These endpoints spawn a local OS process, so they must never be reachable
  * over the network — only from the same machine the PHP server is running on. */
 function rb_require_local(): void {
     $ip = rb_client_ip();
     if (!in_array($ip, ['127.0.0.1', '::1'], true)) {
         rb_json(['error' => 'This action is only allowed from localhost'], 403);
+    }
+}
+
+/** Network discovery is safe to expose to a browser on the same LAN as the
+ * PHP server, because the scan is still executed by this server. It must not
+ * be opened to arbitrary internet clients. */
+function rb_require_same_lan(): void {
+    $client = rb_client_ip();
+    if (in_array($client, ['127.0.0.1', '::1'], true)) return;
+    if (!filter_var($client, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        rb_json(['error' => 'Network scan is available only from the local LAN'], 403);
+    }
+    $network = rb_local_network();
+    if (!$network || !filter_var($network['first'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        rb_json(['error' => 'Could not determine the server LAN'], 500);
+    }
+    $ipLong = ip2long($client);
+    $networkLong = ip2long($network['network']);
+    $maskLong = ip2long($network['mask']);
+    if ($ipLong === false || $networkLong === false || $maskLong === false || (($ipLong & $maskLong) !== ($networkLong & $maskLong))) {
+        rb_json(['error' => 'Network scan is available only to clients on the same LAN as this server'], 403);
     }
 }
 
@@ -83,45 +75,22 @@ function rb_pid_alive(int $pid): bool {
     return posix_kill($pid, 0);
 }
 
-/** Access code for the network-devices sidebar: an explicit env-configured
- * one, or a random one generated on first use and saved locally — same
- * pattern as the control agent's .token file, so it's only ever readable
- * by whoever already has filesystem access to this machine. */
-function rb_network_access_code(array $config): string {
-    // Admin/settings.php is the preferred configuration source. The DB value
-    // overrides config.php/env so administrators do not need to edit source
-    // files when changing the network-panel access code.
-    try {
-        $db = db();
-        $db->query("CREATE TABLE IF NOT EXISTS app_settings (
-            setting_key VARCHAR(100) NOT NULL PRIMARY KEY,
-            setting_value TEXT NULL,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-        $stmt = $db->prepare('SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1');
-        $key = 'network_access_code';
-        $stmt->bind_param('s', $key);
-        $stmt->execute();
-        $row = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
-        if (is_array($row) && !empty($row['setting_value'])) return (string)$row['setting_value'];
-    } catch (Throwable $e) {
-        // Fall through to legacy config/file storage if the DB is not ready.
-    }
-
-    $configured = $config['network']['access_code'] ?? null;
-    if (!empty($configured)) return (string)$configured;
-
-    $tokenFile = __DIR__ . '/data/network-sidebar.token';
-    if (is_file($tokenFile)) {
-        $existing = trim((string)file_get_contents($tokenFile));
-        if ($existing !== '') return $existing;
-    }
-    if (!is_dir(dirname($tokenFile))) @mkdir(dirname($tokenFile), 0700, true);
-    $code = bin2hex(random_bytes(4)); // short — someone has to type this in
-    @file_put_contents($tokenFile, $code);
-    @chmod($tokenFile, 0600);
-    return $code;
+/** Whether something is actually listening on the agent's host:port.
+ *
+ * A PID existing (rb_pid_alive) is NOT proof the agent is actually up: on
+ * Windows in particular, PIDs get recycled quickly, so a stale
+ * agent-run.pid left over from a previous run (crash, reboot, `taskkill`
+ * outside the app, etc.) can point at a completely unrelated process that
+ * now happens to reuse the same PID. When that happens, /api/agent/start
+ * previously trusted the stale PID, reported "already_running": true, and
+ * never actually launched a new agent — so the page's "Start" button says
+ * Running while nothing is listening on 8791 and Connect always fails.
+ * Checking the port directly is the only reliable signal. */
+function rb_port_open(string $host, int $port, float $timeoutSec = 0.35): bool {
+    $target = ($host === '0.0.0.0' || $host === '' || $host === '::') ? '127.0.0.1' : $host;
+    $conn = @stream_socket_client('tcp://' . $target . ':' . $port, $errno, $errstr, $timeoutSec);
+    if ($conn) { fclose($conn); return true; }
+    return false;
 }
 
 /* ---------------------------------------------------------------------
@@ -197,6 +166,187 @@ if ($path === '/api/ice-servers') {
 }
 
 /* ---------------------------------------------------------------------
+ * Auth — login/logout/me. Everything past this point that touches a
+ * device, a session, or the network scanner requires a logged-in user.
+ * ------------------------------------------------------------------- */
+
+if ($path === '/api/auth/login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $body = rb_body();
+    $username = trim((string)($body['username'] ?? ''));
+    $password = (string)($body['password'] ?? '');
+
+    $result = rb_attempt_login(db(), $username, $password);
+    if (!$result['ok']) {
+        $errorsByCode = [
+            'missing' => ['Username and password are required', 400],
+            'rate_limited' => ['Too many attempts. Try again in a few minutes.', 429],
+            'invalid' => ['Invalid username or password', 401],
+        ];
+        [$message, $code] = $errorsByCode[$result['error']] ?? ['Login failed', 400];
+        rb_json(['error' => $message], $code);
+    }
+
+    rb_json(['ok' => true, 'user' => $result['user']]);
+}
+
+if ($path === '/api/auth/logout' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $user = rb_get_current_user();
+    if ($user) rb_audit_log(db(), 'logout', null, ['username' => $user['username']]);
+    $_SESSION = [];
+    session_destroy();
+    rb_json(['ok' => true]);
+}
+
+if ($path === '/api/auth/me' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    $user = rb_get_current_user();
+    if (!$user) rb_json(['authenticated' => false], 401);
+    rb_json(['authenticated' => true, 'user' => $user]);
+}
+
+/* ---------------------------------------------------------------------
+ * Admin — user management + audit log. Everything here requires the
+ * admin role on top of being logged in.
+ * ------------------------------------------------------------------- */
+
+function rb_valid_username(string $u): bool {
+    return (bool)preg_match('/^[A-Za-z0-9_.\-]{3,60}$/', $u);
+}
+
+if ($path === '/api/admin/users' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    rb_require_admin();
+    $db = db();
+    $rows = $db->query(
+        'SELECT id, username, display_name, role, is_active, created_at, last_login_at FROM users ORDER BY created_at ASC'
+    )->fetch_all(MYSQLI_ASSOC);
+    rb_json(['users' => $rows]);
+}
+
+if ($path === '/api/admin/users/create' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $admin = rb_require_admin();
+    $body = rb_body();
+    $username = trim((string)($body['username'] ?? ''));
+    $displayName = trim((string)($body['display_name'] ?? '')) ?: $username;
+    $password = (string)($body['password'] ?? '');
+    $role = (string)($body['role'] ?? 'user');
+
+    if (!rb_valid_username($username)) {
+        rb_json(['error' => 'Username must be 3-60 characters: letters, numbers, dot, dash, underscore'], 400);
+    }
+    if (strlen($password) < 8) {
+        rb_json(['error' => 'Password must be at least 8 characters'], 400);
+    }
+    if (!in_array($role, ['admin', 'user'], true)) {
+        rb_json(['error' => 'Role must be admin or user'], 400);
+    }
+
+    $db = db();
+    $chk = $db->prepare('SELECT id FROM users WHERE username = ? LIMIT 1');
+    $chk->bind_param('s', $username);
+    $chk->execute();
+    $chk->store_result();
+    if ($chk->num_rows > 0) rb_json(['error' => 'That username is already taken'], 409);
+    $chk->close();
+
+    $hash = password_hash($password, PASSWORD_BCRYPT, ['cost' => 10]);
+    $stmt = $db->prepare('INSERT INTO users (username, display_name, password_hash, role, is_active) VALUES (?,?,?,?,1)');
+    $stmt->bind_param('ssss', $username, $displayName, $hash, $role);
+    $stmt->execute();
+    $newId = (int)$stmt->insert_id;
+
+    rb_audit_log($db, 'user_created', null, ['by' => $admin['username'], 'new_user' => $username, 'role' => $role]);
+    rb_json(['ok' => true, 'id' => $newId]);
+}
+
+if ($path === '/api/admin/users/update' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $admin = rb_require_admin();
+    $body = rb_body();
+    $id = (int)($body['id'] ?? 0);
+    if ($id <= 0) rb_json(['error' => 'id required'], 400);
+
+    $db = db();
+    $target = $db->prepare('SELECT id, username, role FROM users WHERE id = ? LIMIT 1');
+    $target->bind_param('i', $id);
+    $target->execute();
+    $targetRow = $target->get_result()->fetch_assoc();
+    if (!$targetRow) rb_json(['error' => 'User not found'], 404);
+
+    $fields = [];
+    $types = '';
+    $values = [];
+
+    if (array_key_exists('display_name', $body)) {
+        $fields[] = 'display_name = ?';
+        $types .= 's';
+        $values[] = trim((string)$body['display_name']);
+    }
+    if (array_key_exists('role', $body)) {
+        $role = (string)$body['role'];
+        if (!in_array($role, ['admin', 'user'], true)) rb_json(['error' => 'Role must be admin or user'], 400);
+        if ($id === $admin['id'] && $role !== 'admin') {
+            rb_json(['error' => "You can't remove your own admin role"], 400);
+        }
+        $fields[] = 'role = ?';
+        $types .= 's';
+        $values[] = $role;
+    }
+    if (array_key_exists('is_active', $body)) {
+        if ($id === $admin['id'] && empty($body['is_active'])) {
+            rb_json(['error' => "You can't deactivate your own account"], 400);
+        }
+        $fields[] = 'is_active = ?';
+        $types .= 'i';
+        $values[] = !empty($body['is_active']) ? 1 : 0;
+    }
+
+    if (!$fields) rb_json(['error' => 'Nothing to update'], 400);
+
+    $sql = 'UPDATE users SET ' . implode(', ', $fields) . ' WHERE id = ?';
+    $types .= 'i';
+    $values[] = $id;
+    $stmt = $db->prepare($sql);
+    $stmt->bind_param($types, ...$values);
+    $stmt->execute();
+
+    rb_audit_log($db, 'user_updated', null, ['by' => $admin['username'], 'target' => $targetRow['username'], 'changes' => array_keys($body)]);
+    rb_json(['ok' => true]);
+}
+
+if ($path === '/api/admin/users/reset-password' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $admin = rb_require_admin();
+    $body = rb_body();
+    $id = (int)($body['id'] ?? 0);
+    $password = (string)($body['password'] ?? '');
+    if ($id <= 0) rb_json(['error' => 'id required'], 400);
+    if (strlen($password) < 8) rb_json(['error' => 'Password must be at least 8 characters'], 400);
+
+    $db = db();
+    $target = $db->prepare('SELECT id, username FROM users WHERE id = ? LIMIT 1');
+    $target->bind_param('i', $id);
+    $target->execute();
+    $targetRow = $target->get_result()->fetch_assoc();
+    if (!$targetRow) rb_json(['error' => 'User not found'], 404);
+
+    $hash = password_hash($password, PASSWORD_BCRYPT, ['cost' => 10]);
+    $stmt = $db->prepare('UPDATE users SET password_hash = ? WHERE id = ?');
+    $stmt->bind_param('si', $hash, $id);
+    $stmt->execute();
+
+    rb_audit_log($db, 'password_reset', null, ['by' => $admin['username'], 'target' => $targetRow['username']]);
+    rb_json(['ok' => true]);
+}
+
+if ($path === '/api/admin/audit-log' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    rb_require_admin();
+    $limit = max(1, min(200, (int)($_GET['limit'] ?? 50)));
+    $db = db();
+    $stmt = $db->prepare('SELECT event_type, remote_id, ip_address, details, created_at FROM audit_log ORDER BY id DESC LIMIT ?');
+    $stmt->bind_param('i', $limit);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    rb_json(['entries' => $rows]);
+}
+
+/* ---------------------------------------------------------------------
  * Device registration — every browser tab that opens the app gets (or
  * reuses) a Remote ID. This is how "connect using remote ID" works.
  * ------------------------------------------------------------------- */
@@ -213,6 +363,7 @@ if (!function_exists('rb_ensure_presence_schema')) {
 }
 
 if ($path === '/api/register' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $auth = rb_require_auth();
     $body = rb_body();
     $remoteId = rb_clean_id((string)($body['remote_id'] ?? ''));
     $deviceName = isset($body['device_name']) ? substr((string)$body['device_name'], 0, 255) : null;
@@ -246,12 +397,14 @@ if ($path === '/api/register' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     // Keep manual presence in its own persistent column. Re-registering on
     // a page refresh must NEVER reset an explicitly selected Online state.
     $stmt = $db->prepare(
-        'INSERT INTO devices (remote_id, device_name, ip_address, last_seen_at, is_online)
-         VALUES (?, ?, ?, NULL, 0)
-         ON DUPLICATE KEY UPDATE device_name = VALUES(device_name), ip_address = VALUES(ip_address)'
+        'INSERT INTO devices (user_id, remote_id, device_name, ip_address, last_seen_at, is_online)
+         VALUES (?, ?, ?, ?, NULL, 0)
+         ON DUPLICATE KEY UPDATE device_name = VALUES(device_name), ip_address = VALUES(ip_address), user_id = VALUES(user_id)'
     );
-    $stmt->bind_param('sss', $remoteId, $deviceName, $ip);
+    $stmt->bind_param('isss', $auth['id'], $remoteId, $deviceName, $ip);
     $stmt->execute();
+
+    rb_audit_log($db, 'device_registered', $remoteId, ['user_id' => $auth['id']]);
 
     $status = $db->prepare('SELECT is_online FROM devices WHERE remote_id = ? LIMIT 1');
     $status->bind_param('s', $remoteId);
@@ -262,6 +415,7 @@ if ($path === '/api/register' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
 /** Lightweight heartbeat so a device shows as "online" while its tab is open. */
 if ($path === '/api/heartbeat' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    rb_require_auth();
     $body = rb_body();
     $remoteId = rb_clean_id((string)($body['remote_id'] ?? ''));
     if (!rb_valid_remote_id($remoteId)) rb_json(['error' => 'valid remote_id required'], 400);
@@ -276,6 +430,7 @@ if ($path === '/api/heartbeat' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 /** Explicitly mark a device offline. This is called only when the user
  * presses Go offline; page refresh/close deliberately does not call it. */
 if ($path === '/api/offline' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    rb_require_auth();
     $body = rb_body();
     $remoteId = rb_clean_id((string)($body['remote_id'] ?? ''));
     if (!rb_valid_remote_id($remoteId)) rb_json(['error' => 'valid remote_id required'], 400);
@@ -288,11 +443,9 @@ if ($path === '/api/offline' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
 /** Looks up the device name + last-seen for a Remote ID, so each side of a
  * session (or an incoming request) can show what device the other party is
- * using, not just their numeric ID. When the requester's browser has the
- * Devices sidebar unlocked, this also cross-references the device's stored
- * IP against this server's own ARP cache — if it shows up there (i.e. it's
- * genuinely on the same local network as this server), its MAC address is
- * included too. Off-LAN / internet peers simply won't have a MAC. */
+ * using, not just their numeric ID. Local peers are cross-referenced against
+ * this server's ARP cache so a same-LAN device can expose its MAC address.
+ * Off-LAN / internet peers simply won't have a MAC. */
 if ($path === '/api/device/lookup' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     $remoteId = rb_clean_id((string)($_GET['remote_id'] ?? ''));
     if ($remoteId === '') rb_json(['error' => 'remote_id required'], 400);
@@ -305,7 +458,7 @@ if ($path === '/api/device/lookup' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 
     $mac = null;
     $onLocalNetwork = false;
-    if (!empty($_SESSION['network_unlocked']) && !empty($row['ip_address'])) {
+    if (!empty($row['ip_address'])) {
         foreach (rb_arp_table() as $arpEntry) {
             if ($arpEntry['ip'] === $row['ip_address']) {
                 $mac = $arpEntry['mac'];
@@ -326,11 +479,75 @@ if ($path === '/api/device/lookup' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     ]);
 }
 
+/** Recently-connected devices for the logged-in account — every browser/
+ * computer that has registered a Remote ID under this user, most recently
+ * active first. Shown in the left sidebar so someone using RemoteBridge from
+ * several machines can tell them apart (and rename them, below). Scoped to
+ * the caller's own devices; nothing here reveals other accounts' devices. */
+if ($path === '/api/devices/recent' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    $auth = rb_require_auth();
+    $db = db();
+    $stmt = $db->prepare(
+        'SELECT remote_id, device_name, ip_address, last_seen_at, is_online, created_at
+         FROM devices
+         WHERE user_id = ?
+         ORDER BY is_online DESC, (last_seen_at IS NULL), last_seen_at DESC, created_at DESC
+         LIMIT 12'
+    );
+    $stmt->bind_param('i', $auth['id']);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    rb_json(['devices' => $rows, 'count' => count($rows)]);
+}
+
+/** Rename one of the caller's own devices (admins may rename any device).
+ * This only ever touches the existing `device_name` column — it's the same
+ * field already shown everywhere else (connection tiles, lookups, etc.). */
+if ($path === '/api/devices/rename' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $auth = rb_require_auth();
+    $body = rb_body();
+    $remoteId = rb_clean_id((string)($body['remote_id'] ?? ''));
+    if (!rb_valid_remote_id($remoteId)) rb_json(['error' => 'valid remote_id required'], 400);
+
+    $name = trim((string)($body['device_name'] ?? ''));
+    // Strip control/newline characters and collapse whitespace; this is a
+    // display label, not free-form text.
+    $name = preg_replace('/[\x00-\x1F\x7F]+/', ' ', $name);
+    $name = preg_replace('/\s+/', ' ', trim((string)$name));
+    if ($name === '') rb_json(['error' => 'Device name is required'], 400);
+    if (mb_strlen($name) > 80) $name = mb_substr($name, 0, 80);
+
+    $db = db();
+    $find = $db->prepare('SELECT user_id, device_name FROM devices WHERE remote_id = ? LIMIT 1');
+    $find->bind_param('s', $remoteId);
+    $find->execute();
+    $row = $find->get_result()->fetch_assoc();
+    if (!$row) rb_json(['error' => 'Device not found'], 404);
+
+    $isOwner = $row['user_id'] !== null && (int)$row['user_id'] === (int)$auth['id'];
+    if (!$isOwner && $auth['role'] !== 'admin') {
+        rb_json(['error' => 'You can only rename your own devices'], 403);
+    }
+
+    $update = $db->prepare('UPDATE devices SET device_name = ? WHERE remote_id = ?');
+    $update->bind_param('ss', $name, $remoteId);
+    $update->execute();
+
+    rb_audit_log($db, 'device_renamed', $remoteId, [
+        'by_user_id' => $auth['id'],
+        'previous_name' => $row['device_name'],
+        'new_name' => $name,
+    ]);
+
+    rb_json(['ok' => true, 'remote_id' => $remoteId, 'device_name' => $name]);
+}
+
 /* ---------------------------------------------------------------------
  * Sessions — pairing between an initiator (viewer) and a target (host)
  * ------------------------------------------------------------------- */
 
 if ($path === '/api/session/create' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    rb_require_auth();
     $body = rb_body();
     $target = rb_clean_id((string)($body['target_remote_id'] ?? ''));
     $initiator = rb_clean_id((string)($body['initiator_remote_id'] ?? ''));
@@ -394,6 +611,7 @@ if ($path === '/api/session/status' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 }
 
 if ($path === '/api/session/respond' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    rb_require_auth();
     $body = rb_body();
     $sessionId = preg_replace('/[^A-Za-z0-9]/', '', (string)($body['session_id'] ?? ''));
     $action = (string)($body['action'] ?? '');
@@ -481,12 +699,23 @@ $rbAgentIsWindows = stripos(PHP_OS, 'WIN') === 0;
 
 if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     rb_require_local();
+    rb_require_auth();
+
+    $agentConfigPre = $config['agent'] ?? [];
+    $preHost = (string)($agentConfigPre['host'] ?? '127.0.0.1');
+    $prePort = (int)($agentConfigPre['port'] ?? 8791);
 
     if (is_file($rbAgentPidFile)) {
         $existingPid = (int)trim((string)file_get_contents($rbAgentPidFile));
-        if (rb_pid_alive($existingPid)) {
+        // Require BOTH a live PID and an actually-listening port. A PID alone
+        // is not trustworthy (see rb_port_open() above) — trusting it here
+        // is what previously made the UI report "already running" for an
+        // agent that was not actually reachable.
+        if (rb_pid_alive($existingPid) && rb_port_open($preHost, $prePort)) {
             rb_json(['ok' => true, 'already_running' => true, 'pid' => $existingPid]);
         }
+        // Stale/incorrect PID file — remove it and fall through to start fresh.
+        @unlink($rbAgentPidFile);
     }
 
     if (!is_dir($rbAgentDir)) rb_json(['error' => 'agent/ directory not found'], 500);
@@ -498,12 +727,18 @@ if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $agentPort = (int)($agentConfig['port'] ?? 8791);
 
     if ($rbAgentIsWindows) {
-        // /B keeps it attached to this proc_open call (so proc_get_status
-        // reports it) without opening a separate console window.
+        // cmd.exe does not treat single quotes as path quoting. The previous
+        // launcher therefore failed on common XAMPP paths such as C:\xampp\htdocs.
         $safeHost = preg_replace('/[^A-Za-z0-9_.:\-]/', '', $agentHost) ?: '127.0.0.1';
-        $cmd = 'cmd /V:ON /C "set RB_AGENT_HOST=' . $safeHost . '&& set RB_AGENT_PORT=' . $agentPort . '&& cd /d ' . escapeshellarg($rbAgentDir)
-             . ' && npm install 1>>' . escapeshellarg($rbAgentLog) . ' 2>&1'
-             . ' && node control-agent.js 1>>' . escapeshellarg($rbAgentLog) . ' 2>&1"';
+        $agentDirCmd = '"' . str_replace('"', '', $rbAgentDir) . '"';
+        $agentLogCmd = '"' . str_replace('"', '', $rbAgentLog) . '"';
+        // Do not wrap the whole /C command in another pair of quotes: nested
+        // quoted Windows paths would otherwise terminate cmd.exe's command
+        // string early. The paths themselves remain quoted.
+        $cmd = 'cmd.exe /D /C set RB_AGENT_HOST=' . $safeHost . '&& set RB_AGENT_PORT=' . $agentPort
+             . '&& cd /d ' . $agentDirCmd
+             . ' && if exist node_modules\.bin\node.cmd (node control-agent.js) else (npm install --no-audit --no-fund && node control-agent.js)'
+             . ' 1>>' . $agentLogCmd . ' 2>&1';
     } else {
         // exec replaces the shell with node once npm install finishes, so the
         // PID we capture below stays valid for the whole lifetime of the agent.
@@ -530,11 +765,19 @@ if ($path === '/api/agent/start' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 /** Polled by the page's in-browser console to tail the agent's output. */
 if ($path === '/api/agent/output' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     rb_require_local();
+    rb_require_auth();
     $offset = max(0, (int)($_GET['offset'] ?? 0));
 
     $running = false;
     if (is_file($rbAgentPidFile)) {
-        $running = rb_pid_alive((int)trim((string)file_get_contents($rbAgentPidFile)));
+        $agentConfigOut = $config['agent'] ?? [];
+        $outHost = (string)($agentConfigOut['host'] ?? '127.0.0.1');
+        $outPort = (int)($agentConfigOut['port'] ?? 8791);
+        $pidFromFile = (int)trim((string)file_get_contents($rbAgentPidFile));
+        // Same reasoning as /api/agent/start: only trust the PID once the
+        // port is confirmed listening, otherwise a stale/reused PID makes
+        // the console falsely claim the agent is still running.
+        $running = rb_pid_alive($pidFromFile) && rb_port_open($outHost, $outPort);
     }
 
     $chunk = '';
@@ -557,6 +800,7 @@ if ($path === '/api/agent/output' && $_SERVER['REQUEST_METHOD'] === 'GET') {
 
 if ($path === '/api/agent/stop' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     rb_require_local();
+    rb_require_auth();
     $pid = is_file($rbAgentPidFile) ? (int)trim((string)file_get_contents($rbAgentPidFile)) : 0;
     if ($pid > 0 && rb_pid_alive($pid)) {
         if ($rbAgentIsWindows) {
@@ -581,24 +825,29 @@ function rb_mac_looks_valid(string $mac): bool {
     return (bool)preg_match('/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i', $mac) && strtolower($mac) !== '00:00:00:00:00:00';
 }
 
-/** Best-effort device-name lookup. Network discovery can reliably provide an
- * IP and MAC from ARP, but a human/device name is only available when the LAN
- * exposes DNS/NetBIOS information. Prefer reverse DNS and keep the lookup
- * non-fatal so one unavailable hostname never blocks the whole device list. */
-function rb_resolve_device_name(string $ip): ?string {
-    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return null;
-    $host = @gethostbyaddr($ip);
-    if ($host && $host !== $ip && preg_match('/^[a-zA-Z0-9._-]+$/', $host)) {
-        return $host;
-    }
-    return null;
-}
-
+/** Hostname lookups are intentionally not performed during a scan. Reverse DNS
+ * can block for many seconds on a LAN with no DNS server, making discovery
+ * appear to freeze. Device names are therefore taken from native ARP/NetBIOS
+ * output when the OS provides them; otherwise the UI uses the IP address. */
 function rb_arp_table(): array {
     $devices = [];
     $isWindows = stripos(PHP_OS, 'WIN') === 0;
 
     if ($isWindows) {
+        // Windows 10/11 keeps a richer neighbor table than `arp -a`, including
+        // entries that are stale/reachable but not printed in the legacy ARP
+        // format. Read both sources and merge them.
+        $ps = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.AddressFamily -eq 2 -and $_.LinkLayerAddress} | ForEach-Object {$_.IPAddress + [char]124 + $_.LinkLayerAddress + [char]124 + $_.State}" 2>NUL';
+        $neighborOut = (string)shell_exec($ps);
+        foreach (explode("\n", $neighborOut) as $line) {
+            $parts = array_map('trim', explode('|', trim($line)));
+            if (count($parts) < 2) continue;
+            $ip = $parts[0];
+            $mac = strtolower(str_replace('-', ':', $parts[1]));
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || !rb_mac_looks_valid($mac)) continue;
+            $devices[$ip] = ['ip' => $ip, 'mac' => $mac, 'type' => strtolower($parts[2] ?? '') === 'static' ? 'static' : 'dynamic'];
+        }
+
         $out = shell_exec('arp -a 2>NUL') ?: '';
         foreach (explode("\n", $out) as $line) {
             if (preg_match('/^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F-]{17})\s+(\S+)/', $line, $m)) {
@@ -632,10 +881,7 @@ function rb_arp_table(): array {
     $list = array_values($devices);
     foreach ($list as &$entry) {
         if (empty($entry['hostname'])) {
-            $entry['hostname'] = rb_resolve_device_name((string)$entry['ip']);
-        }
-        if (empty($entry['hostname'])) {
-            $entry['hostname'] = 'Unknown device';
+            $entry['hostname'] = 'Device ' . (string)$entry['ip'];
         }
     }
     unset($entry);
@@ -654,60 +900,122 @@ function rb_server_lan_ipv4(): ?string {
         return $server;
     }
 
+    // Prefer the interface that owns the default route. This avoids selecting
+    // VMware/VirtualBox/VPN adapters before the real Wi-Fi/Ethernet adapter.
     if (stripos(PHP_OS, 'WIN') === 0) {
+        $ps = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+            . '"$c=Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway -and $_.IPv4Address}; '
+            . '$c | ForEach-Object {$_.IPv4Address | ForEach-Object {$_.IPAddress}}" 2>NUL';
+        $out = (string)shell_exec($ps);
+        foreach (preg_split('/\R/', trim($out)) ?: [] as $candidate) {
+            $candidate = trim($candidate);
+            if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($candidate, '127.')) return $candidate;
+        }
+
+        // Older Windows/PowerShell installations may not expose
+        // Get-NetIPConfiguration; keep ipconfig as a fallback.
         $out = (string)shell_exec('ipconfig 2>NUL');
         if (preg_match_all('/IPv4 Address[^:]*:\s*([0-9.]+)/i', $out, $m)) {
-            foreach ($m[1] as $ip) {
-                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
-                    && !str_starts_with($ip, '127.')) return $ip;
+            foreach ($m[1] as $candidate) {
+                if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                    && !str_starts_with($candidate, '127.')) return $candidate;
             }
         }
     } else {
+        // Linux: ask the kernel which source address it would use for an
+        // external route, which is a reliable way to select the active LAN NIC.
+        $out = trim((string)shell_exec('ip -4 route get 1.1.1.1 2>/dev/null'));
+        if (preg_match('/\bsrc\s+(\d{1,3}(?:\.\d{1,3}){3})\b/', $out, $m)) {
+            if (filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($m[1], '127.')) return $m[1];
+        }
         $out = trim((string)shell_exec('hostname -I 2>/dev/null'));
-        foreach (preg_split('/\s+/', $out) ?: [] as $ip) {
-            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
-                && !str_starts_with($ip, '127.')) return $ip;
+        foreach (preg_split('/\s+/', $out) ?: [] as $candidate) {
+            if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($candidate, '127.')) return $candidate;
         }
     }
     return null;
 }
 
-/** Best-effort /24 subnet prefix used by the network scan. */
-function rb_local_subnet_prefix(): ?string {
+/** Determine the LAN network used by discovery. We prefer the real
+ * interface netmask/prefix and fall back to the common /24 LAN layout. */
+function rb_local_network(): ?array {
     $ip = rb_server_lan_ipv4();
-    if (!$ip || !preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/', $ip, $m)) return null;
-    return $m[1];
-}
+    if (!$ip) return null;
 
-if ($path === '/api/network/status') {
-    rb_require_local();
-    rb_json(['unlocked' => !empty($_SESSION['network_unlocked'])]);
-}
+    $prefixLength = null;
+    if (stripos(PHP_OS, 'WIN') === 0) {
+        // Ask Windows directly for the prefix attached to the selected IP.
+        $safeIp = escapeshellarg($ip);
+        $ps = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+            . '"$x=Get-NetIPAddress -AddressFamily IPv4 -IPAddress ' . $safeIp . ' -ErrorAction SilentlyContinue; '
+            . 'if($x){$x.PrefixLength}" 2>NUL';
+        $prefixOut = trim((string)shell_exec($ps));
+        if (preg_match('/\b(\d{1,2})\b/', $prefixOut, $m)) {
+            $candidate = (int)$m[1];
+            if ($candidate >= 1 && $candidate <= 30) $prefixLength = $candidate;
+        }
 
-if ($path === '/api/network/unlock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    rb_require_local();
-    $body = rb_body();
-    $submitted = (string)($body['code'] ?? '');
-    $expected = rb_network_access_code($config);
-    if ($submitted === '' || !hash_equals($expected, $submitted)) {
-        rb_json(['ok' => false, 'error' => 'Incorrect code'], 403);
+        // Fallback for older Windows versions.
+        if ($prefixLength === null) {
+            $out = (string)shell_exec('ipconfig 2>NUL');
+            $lines = preg_split('/\R/', $out) ?: [];
+            $candidateIp = false;
+            foreach ($lines as $line) {
+                if (preg_match('/IPv4 Address[^:]*:\s*([0-9.]+)/i', $line, $m)) {
+                    $candidateIp = $m[1] === $ip;
+                    continue;
+                }
+                if ($candidateIp && preg_match('/Subnet Mask[^:]*:\s*([0-9.]+)/i', $line, $m)) {
+                    $mask = $m[1];
+                    $bits = 0;
+                    foreach (explode('.', $mask) as $octet) $bits += substr_count(decbin((int)$octet), '1');
+                    if ($bits >= 1 && $bits <= 30) { $prefixLength = $bits; break; }
+                }
+            }
+        }
+    } else {
+        $out = (string)shell_exec('ip -4 addr show 2>/dev/null');
+        if (preg_match_all('/inet\s+(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})\s+/m', $out, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) {
+                if ($row[1] === $ip) { $prefixLength = (int)$row[2]; break; }
+            }
+        }
     }
-    if (session_status() === PHP_SESSION_ACTIVE) {
-        session_regenerate_id(true);
-    }
-    $_SESSION['network_unlocked'] = true;
-    rb_json(['ok' => true]);
-}
+    if ($prefixLength === null) $prefixLength = 24;
 
-if ($path === '/api/network/lock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    rb_require_local();
-    unset($_SESSION['network_unlocked']);
-    rb_json(['ok' => true]);
+    $ipLong = ip2long($ip);
+    if ($ipLong === false) return null;
+    $mask = $prefixLength === 0 ? 0 : ((-1 << (32 - $prefixLength)) & 0xffffffff);
+    $networkLong = $ipLong & $mask;
+    $broadcastLong = $networkLong | (~$mask & 0xffffffff);
+    $first = $networkLong + 1;
+    $last = $broadcastLong - 1;
+    if ($prefixLength >= 31) { $first = $networkLong; $last = $broadcastLong; }
+
+    $hostCount = max(1, $last - $first + 1);
+    // A /16 or larger can contain tens of thousands of addresses. Keep the
+    // web request bounded, while still scanning a useful 4094-host window.
+    if ($hostCount > 4094) $last = $first + 4093;
+
+    return [
+        'ip' => $ip,
+        'prefix' => $prefixLength,
+        'network' => long2ip($networkLong),
+        'broadcast' => long2ip($broadcastLong),
+        'first' => long2ip($first),
+        'last' => long2ip($last),
+        'mask' => long2ip($mask),
+        'cidr' => long2ip($networkLong) . '/' . $prefixLength,
+        'host_count' => $hostCount,
+    ];
 }
 
 if ($path === '/api/network/devices' && $_SERVER['REQUEST_METHOD'] === 'GET') {
-    rb_require_local();
-    if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
+    rb_require_same_lan();
+    rb_require_admin();
     $devices = rb_arp_table();
     rb_json(['devices' => $devices, 'count' => count($devices)]);
 }
@@ -732,9 +1040,8 @@ function rb_is_local_user_ip(?string $ip): bool {
 }
 
 if ($path === '/api/network/users' && $_SERVER['REQUEST_METHOD'] === 'GET') {
-    rb_require_local();
-    if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
-
+    rb_require_same_lan();
+    rb_require_admin();
     // This endpoint intentionally represents BOTH the network devices visible
     // to the server and the RemoteBridge users currently online on the same LAN.
     // ARP is not a complete list by itself: phones, Wi-Fi clients, VPN clients,
@@ -864,48 +1171,66 @@ function rb_run_bounded_process(string $command, int $timeoutMs = 5000): array {
 }
 
 if ($path === '/api/network/scan' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    rb_require_local();
-    if (empty($_SESSION['network_unlocked'])) rb_json(['error' => 'locked'], 403);
+    rb_require_same_lan();
+    $netAuth = rb_require_admin();
+    rb_audit_log(db(), 'network_scan', null, ['admin' => $netAuth['username']]);
 
-    $prefix = rb_local_subnet_prefix();
-    if (!$prefix) rb_json(['error' => 'Could not determine the local subnet to scan'], 500);
+    $network = rb_local_network();
+    if (!$network) rb_json(['error' => 'Could not determine the local network to scan'], 500);
 
     $isWindows = stripos(PHP_OS, 'WIN') === 0;
-    $scanTimeoutMs = 6000;
+    // The helper probes the complete detected host range. Keep the HTTP job
+    // bounded so discovery cannot hang or interfere with the rest of the app.
+    $scanTimeoutMs = 15000;
     $result = ['ok' => false, 'timed_out' => false];
 
     if ($isWindows) {
         $script = __DIR__ . DIRECTORY_SEPARATOR . 'agent' . DIRECTORY_SEPARATOR . 'network-scan.ps1';
         if (!is_readable($script)) rb_json(['error' => 'Network scan helper is missing'], 500);
-
-        // PowerShell is a child of this request and is forcibly terminated if
-        // it exceeds the hard timeout. It is never started with start /B.
-        $cmd = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
-             . escapeshellarg($script) . ' -Prefix ' . escapeshellarg($prefix);
+        $cmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
+             . escapeshellarg($script)
+             . ' -First ' . escapeshellarg($network['first'])
+             . ' -Last ' . escapeshellarg($network['last']);
         $result = rb_run_bounded_process($cmd, $scanTimeoutMs);
     } else {
         $script = __DIR__ . DIRECTORY_SEPARATOR . 'agent' . DIRECTORY_SEPARATOR . 'network-scan.sh';
-        if (is_readable($script)) {
-            $cmd = 'sh ' . escapeshellarg($script) . ' ' . escapeshellarg($prefix);
-            $result = rb_run_bounded_process($cmd, $scanTimeoutMs);
-        } else {
-            rb_json(['error' => 'Network scan helper is missing'], 500);
-        }
+        if (!is_readable($script)) rb_json(['error' => 'Network scan helper is missing'], 500);
+        $cmd = 'sh ' . escapeshellarg($script)
+             . ' ' . escapeshellarg($network['first'])
+             . ' ' . escapeshellarg($network['last']);
+        $result = rb_run_bounded_process($cmd, $scanTimeoutMs);
     }
 
-    // A timeout is a bounded scan completion, not a server failure. ARP may
-    // still contain partial results and those are returned to the UI.
+    // ARP contains the layer-2 neighbors learned by the host. The sweep above
+    // refreshes it across the detected subnet, then the API returns the current
+    // valid IPv4/MAC entries. Do not report a failed helper process as a
+    // successful scan: that made the UI look like discovery worked when the
+    // PHP/Windows host could not execute the scanner.
     $devices = rb_arp_table();
+    if (!$result['ok'] && !$result['timed_out']) {
+        $detail = trim((string)($result['stderr'] ?? ''));
+        if ($detail === '') $detail = 'The network scan helper could not be executed by PHP.';
+        rb_json([
+            'ok' => false,
+            'subnet' => $network['cidr'],
+            'host_range' => $network['first'] . ' - ' . $network['last'],
+            'devices' => $devices,
+            'count' => count($devices),
+            'error' => $detail,
+        ], 500);
+    }
+
     rb_json([
         'ok' => true,
         'started' => true,
         'completed' => !$result['timed_out'],
         'timed_out' => $result['timed_out'],
-        'subnet' => $prefix . '.0/24',
+        'subnet' => $network['cidr'],
+        'host_range' => $network['first'] . ' - ' . $network['last'],
         'devices' => $devices,
         'count' => count($devices),
         'message' => $result['timed_out']
-            ? 'Network scan stopped at the safety timeout; partial results are shown.'
+            ? 'The scan reached its time limit; devices discovered so far are shown.'
             : 'Network scan completed.'
     ]);
 }
@@ -917,6 +1242,12 @@ if ($path === '/api/network/scan' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 if ($path !== '/' && $path !== '/index.php') {
     rb_json(['error' => 'Not found'], 404);
 }
+
+if (!rb_is_authenticated()) {
+    header('Location: ' . $basePath . '/login.php');
+    exit;
+}
+$rbCurrentUser = rb_get_current_user();
 ?>
 <!doctype html>
 <html lang="en">
@@ -997,6 +1328,15 @@ main{max-width:900px;margin:0 auto;width:100%}
 .device-tile .drow span:last-child{color:#cfe0f7}
 .device-empty{color:#9db0ca;font-size:13px;padding:14px 4px}
 
+/* ---- Collapsible "Details" dropdown inside device/user tiles ---- */
+.tile-details{margin-top:8px}
+.tile-details summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;color:#8fa2c0;user-select:none;padding:2px 0}
+.tile-details summary::-webkit-details-marker{display:none}
+.tile-details summary::before{content:'▸';display:inline-block;font-size:10px;color:#5f7aa8;transition:transform .15s}
+.tile-details[open] summary::before{transform:rotate(90deg)}
+.tile-details summary:hover{color:#cfe0f7}
+.tile-details[open]{padding-bottom:2px}
+
 /* ---- Connected-session tiles (host & viewer) showing remote ID + device ---- */
 .connected-list{display:grid;gap:10px;margin-top:14px}
 .connected-tile{background:#0f2a1c;border:1px solid #2f6b45;border-radius:12px;padding:11px 13px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
@@ -1021,10 +1361,61 @@ main{max-width:900px;margin:0 auto;width:100%}
 .local-user-tile .uid{font-family:ui-monospace,monospace;font-size:12px;color:#eaf1ff;margin-top:3px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}.local-user-tile .uid .remote-copy-btn{margin-left:2px}
 .local-user-tile .umeta{font-family:ui-monospace,monospace;font-size:11px;color:#9db0ca;margin-top:4px;word-break:break-word}
 
+.recent-device-list{display:grid;gap:9px;margin-top:12px}
+.recent-device-tile{background:#0a1729;border:1px solid #1b304c;border-radius:11px;padding:10px 11px}
+.recent-device-tile .rdname-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.recent-device-tile .rdname{font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;min-width:0}
+.recent-device-tile .rdname span.dot{width:7px;height:7px;border-radius:50%;background:#455a80;flex-shrink:0}
+.recent-device-tile .rdname.online span.dot{background:#3fbf6f}
+.recent-device-tile .rdname .rdname-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.recent-device-tile .rdmeta{font-family:ui-monospace,monospace;font-size:11px;color:#9db0ca;margin-top:5px;word-break:break-word}
+.recent-device-tile .rdmeta .rd-status{font-family:Inter,system-ui,sans-serif;color:#7fd99a}
+.rd-rename-btn{background:transparent;border:1px solid #2c4262;color:#9db0ca;border-radius:7px;padding:3px 6px;line-height:1;flex-shrink:0}
+.rd-rename-btn:hover{border-color:#3a5680;color:#cfe0f7;background:#0e1b2f}
+.rd-rename-row{display:flex;gap:6px;margin-top:8px}
+.rd-rename-row input{flex:1;min-width:0;padding:6px 9px;border-radius:8px;border:1px solid #253b5a;background:#07101c;color:#eaf1ff;font-size:12px;outline:none}
+.rd-rename-row input:focus{border-color:#3a6fbb;box-shadow:0 0 0 2px rgba(43,109,232,.18)}
+.rd-rename-row button{padding:6px 10px;font-size:11.5px;border-radius:8px}
+.rd-rename-error{color:#f2a3a3;font-size:11px;margin-top:5px}
+
 /* ---- Navbar "Setup guide" reopen button ---- */
 .navbar-actions{display:flex;align-items:center;gap:10px;flex-shrink:0}
 .link-btn{background:transparent;border:1px solid #2c4262;color:#cfe0f7;padding:8px 13px;font-size:12.5px;font-weight:600;border-radius:9px;white-space:nowrap}
 .link-btn:hover{border-color:#3a5680;background:#0e1b2f}
+.navbar-divider{width:1px;height:26px;background:#1f3454;flex-shrink:0;margin:0 2px}
+
+/* ---- Navbar dropdowns (Network / Menu) ---- */
+.nav-dropdown{position:relative}
+.nav-dropdown-btn{display:inline-flex;align-items:center;gap:6px}
+.nav-dropdown-btn .caret{font-size:10px;opacity:.8;transition:transform .15s}
+.nav-dropdown.open .nav-dropdown-btn .caret{transform:rotate(180deg)}
+.nav-badge{background:#2b6de8;color:#fff;font-size:10px;font-weight:800;padding:1px 6px;border-radius:999px;line-height:1.5;min-width:16px;text-align:center;display:inline-block}
+.nav-dropdown-panel{position:absolute;top:calc(100% + 10px);right:0;min-width:230px;background:#0c1c33;border:1px solid #253b5a;border-radius:14px;box-shadow:0 24px 60px rgba(0,0,0,.45);padding:10px;z-index:250}
+.nav-dropdown-panel.hidden{display:none !important}
+.nav-dropdown-item{display:block;width:100%;text-align:left;background:transparent;border:0;color:#cfe0f7;padding:9px 10px;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none}
+.nav-dropdown-item:hover{background:#132340}
+.nav-dropdown-status{display:flex;align-items:center;gap:8px;padding:8px 10px;margin-bottom:4px;border-radius:9px;background:#07101c;border:1px solid #1e3049;font-size:12px;color:#9db0ca}
+.nav-dropdown-divider{height:1px;background:#1f3454;margin:6px 2px}
+.nav-network-panel{width:300px}
+.nav-network-panel .row{margin-top:10px}
+.nav-network-panel .row button{flex:1;font-size:12px;padding:9px 10px}
+
+/* ---- Shared filter/search inputs (device & user lists) ---- */
+.filter-input{width:100%;padding:9px 12px;border-radius:10px;border:1px solid #253b5a;background:#07101c;color:#eaf1ff;font-family:Inter,system-ui,sans-serif;font-size:12.5px;outline:none;margin:2px 0 0;appearance:none;-webkit-appearance:none}
+.filter-input::placeholder{color:#6f83a3;opacity:1}
+.filter-input:focus{border-color:#3a6fbb;box-shadow:0 0 0 2px rgba(43,109,232,.18)}
+.filter-input::-webkit-search-cancel-button{filter:invert(.6)}
+.device-grid-modal{grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+.local-users-grid-modal{grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+.user-chip{display:flex;align-items:center;gap:9px;background:#0e1b2f;border:1px solid #253b5a;border-radius:999px;padding:5px 14px 5px 6px;white-space:nowrap}
+.user-avatar{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#2b6de8,#7b3fe4);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:11.5px;color:#fff;flex-shrink:0}
+.user-chip .uname{font-size:12.5px;font-weight:700;color:#eaf1ff}
+.role-chip{font-size:9.5px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;padding:2px 8px;border-radius:999px;border:1px solid #2c4262}
+.role-chip.admin{background:#1e2e50;border-color:#3a56a0;color:#a9c3ff}
+.role-chip.user{background:#173822;border-color:#2f6b45;color:#8fe3a3}
+.logout-btn{background:#20324d;color:#eaf1ff;padding:8px 14px;font-size:12.5px;border-radius:9px}
+.logout-btn:hover{background:#28405f}
+@media(max-width:760px){.user-chip .uname{display:none}.navbar-divider{display:none}}
 
 /* ---- Initial setup modal (Local vs Internet + advanced manual) ---- */
 .modal-overlay{position:fixed;inset:0;background:rgba(4,9,18,.72);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:300;padding:20px}
@@ -1081,9 +1472,39 @@ main{max-width:900px;margin:0 auto;width:100%}
     <p class="sub">Web-based remote desktop over WebRTC — no install, connect with a Remote ID</p>
   </div>
   <div class="navbar-actions">
-    <button class="link-btn" onclick="rbOpenSetupModal()">Setup guide</button>
-    <a class="link-btn" href="<?= htmlspecialchars($basePath . '/admin/settings.php', ENT_QUOTES) ?>">Admin settings</a>
-    <div id="status" class="status">Checking database…</div>
+    <?php if ($rbCurrentUser['role'] === 'admin'): ?>
+    <div class="nav-dropdown" id="navNetworkDropdown">
+      <button type="button" class="link-btn nav-dropdown-btn" onclick="rbToggleNavDropdown('navNetworkDropdown', event)">
+        Network <span id="navDeviceBadge" class="nav-badge hidden"></span> <span class="caret">▾</span>
+      </button>
+      <div class="nav-dropdown-panel nav-network-panel hidden" id="navNetworkPanel">
+        <div id="navDeviceCount" class="muted" style="font-size:12px">Loading…</div>
+        <div id="navUserCount" class="muted" style="font-size:12px;margin-top:2px"></div>
+        <div class="row">
+          <button type="button" class="secondary" onclick="rbOpenNetworkModal('devices'); rbScanDevices();">Scan all devices</button>
+          <button type="button" class="secondary" onclick="rbOpenNetworkModal('devices')">View details</button>
+        </div>
+      </div>
+    </div>
+    <?php endif; ?>
+    <div class="nav-dropdown" id="navMenuDropdown">
+      <button type="button" class="link-btn nav-dropdown-btn" onclick="rbToggleNavDropdown('navMenuDropdown', event)">Menu <span class="caret">▾</span></button>
+      <div class="nav-dropdown-panel hidden" id="navMenuPanel">
+        <div class="nav-dropdown-status"><span id="status">Checking database…</span></div>
+        <button type="button" class="nav-dropdown-item" onclick="rbCloseNavDropdowns(); rbOpenSetupModal();">Setup guide</button>
+        <?php if ($rbCurrentUser['role'] === 'admin'): ?>
+        <a class="nav-dropdown-item" href="<?= htmlspecialchars($basePath . '/admin/settings.php', ENT_QUOTES) ?>">Admin settings</a>
+        <?php endif; ?>
+        <div class="nav-dropdown-divider"></div>
+        <button type="button" class="nav-dropdown-item" onclick="rbLogout()">Log out</button>
+      </div>
+    </div>
+    <div class="navbar-divider"></div>
+    <div class="user-chip">
+      <div class="user-avatar"><?= htmlspecialchars(strtoupper(substr($rbCurrentUser['display_name'], 0, 1)), ENT_QUOTES) ?></div>
+      <span class="uname"><?= htmlspecialchars($rbCurrentUser['display_name'], ENT_QUOTES) ?></span>
+      <span class="role-chip <?= $rbCurrentUser['role'] === 'admin' ? 'admin' : 'user' ?>"><?= htmlspecialchars($rbCurrentUser['role'], ENT_QUOTES) ?></span>
+    </div>
   </div>
 </header>
 
@@ -1124,7 +1545,7 @@ main{max-width:900px;margin:0 auto;width:100%}
           <li><strong>Start the server.</strong> <code>php -S 0.0.0.0:8080 index.php</code>, then open <code>http://127.0.0.1:8080/</code>. Running under XAMPP/Apache in a subfolder works too — the frontend detects the install path automatically.</li>
           <li><strong>Set up TURN for internet use (optional).</strong> A free shared TURN relay (Open Relay Project) is used automatically with zero setup. For production or heavy use, set <code>RB_TURN_URL</code>, <code>RB_TURN_USERNAME</code>, and <code>RB_TURN_CREDENTIAL</code> in <code>config.php</code>, or set <code>RB_DISABLE_FREE_TURN=1</code> to turn the free fallback off.</li>
           <li><strong>Enable remote control (optional).</strong> On the host side, under the "Share my screen" tab → "Native control agent", click <strong>Run server</strong> (or run <code>cd agent && npm install && node control-agent.js</code> yourself), paste the token it prints, and click Connect. Only do this for someone you trust — once granted, control stays active until you uncheck it.</li>
-          <li><strong>Unlock the Devices sidebar (optional).</strong> The right-hand "Devices on this network" panel is protected by the Network Access Code. Configure or regenerate it from <code>admin/settings.php</code>; legacy <code>config.php</code>/<code>RB_NETWORK_ACCESS_CODE</code> values remain supported as a fallback.</li>
+          <li><strong>Scan the local network.</strong> The "Devices on this network" panel can scan the detected LAN subnet directly. No access code is required.</li>
         </ol>
       </div>
     </div>
@@ -1137,10 +1558,57 @@ main{max-width:900px;margin:0 auto;width:100%}
 </div>
 
 <div class="layout">
+<?php if ($rbCurrentUser['role'] === 'admin'): ?>
+<div id="networkModal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <div>
+        <h2>Devices on this network</h2>
+        <p>Scan the complete detected local subnet from this server. Active devices are discovered through ICMP/ARP and displayed with their IP, MAC, and hostname when available.</p>
+      </div>
+      <button class="modal-close" type="button" onclick="rbCloseNetworkModal()" aria-label="Close">×</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="modal-tab active" id="networkTabDevices" type="button" onclick="rbShowNetworkTab('devices')">Devices</button>
+      <button class="modal-tab" id="networkTabUsers" type="button" onclick="rbShowNetworkTab('users')">Users connected locally</button>
+    </div>
+    <div class="modal-body">
+      <div id="networkPanelDevices">
+        <input type="search" id="deviceSearchModal" class="filter-input" placeholder="Filter by IP, MAC, hostname or type…" oninput="rbRenderDeviceGrid()">
+        <div class="row" style="margin-top:10px">
+          <button id="btnScanDevicesModal" class="secondary" type="button" onclick="rbScanDevices()">Scan all devices</button>
+          <button class="secondary" type="button" onclick="rbLoadDevices()">Refresh</button>
+        </div>
+        <div id="deviceCountModal" class="muted" style="margin-top:8px;font-size:12.5px"></div>
+        <div id="deviceGridModal" class="device-grid device-grid-modal"><div class="device-empty">Loading…</div></div>
+      </div>
+      <div id="networkPanelUsers" class="hidden">
+        <input type="search" id="userSearchModal" class="filter-input" placeholder="Filter by name, IP, MAC or Remote ID…" oninput="rbRenderLocalUsersGrid()">
+        <div class="row" style="margin-top:10px">
+          <button class="secondary" type="button" onclick="rbLoadLocalUsers()">Refresh</button>
+        </div>
+        <div id="localUserCountModal" class="muted" style="margin-top:8px;font-size:12.5px"></div>
+        <div id="localUsersGridModal" class="local-users-grid local-users-grid-modal"><div class="device-empty">Loading…</div></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span class="muted" style="font-size:12px">Refreshes automatically every 10 seconds while this page is open.</span>
+      <button class="secondary" type="button" onclick="rbCloseNetworkModal()">Close</button>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
+
 <aside class="sidebar sidebar-left">
   <div class="card">
     <h2>Activity log</h2>
     <div id="log" class="log">Ready.</div>
+  </div>
+  <div class="card">
+    <h2>Recent devices</h2>
+    <p class="muted" style="font-size:12.5px">Devices recorded for your account in the database — no live network scan runs for this list. Most recent first. Rename any of them to tell them apart.</p>
+    <div id="recentDeviceCount" class="muted" style="margin-top:6px;font-size:12.5px"></div>
+    <div id="recentDeviceList" class="recent-device-list"><div class="device-empty">Loading…</div></div>
   </div>
 </aside>
 
@@ -1286,24 +1754,16 @@ Click "Run server" to start — output streams here.
 </main>
 
 <aside class="sidebar sidebar-right">
+  <?php if ($rbCurrentUser['role'] === 'admin'): ?>
   <div class="card">
     <h2>Devices on this network</h2>
-    <p class="muted" style="font-size:12.5px">Read from this server's own ARP cache — only devices it has recently talked to on the LAN. Local machine only.</p>
+    <p class="muted" style="font-size:12.5px">Scan the complete detected local subnet from this server. Active devices are discovered through ICMP/ARP and displayed with their IP, MAC, and hostname when available.</p>
 
-    <div id="deviceLocked">
-      <p class="muted" style="font-size:12.5px;margin-top:10px">Locked. Enter the Network Access Code configured in <a href="<?= htmlspecialchars($basePath . '/admin/settings.php', ENT_QUOTES) ?>" style="color:#9ec5ff">Admin settings</a>. Legacy <code>config.php</code>/<code>RB_NETWORK_ACCESS_CODE</code> values are used only as a fallback.</p>
-      <div class="row" style="margin-top:8px">
-        <input type="text" id="networkAccessCode" placeholder="Access code">
-        <button onclick="rbUnlockDevices()">Unlock</button>
-      </div>
-      <p id="networkUnlockError" class="muted hidden" style="margin-top:6px;color:#f2c58a"></p>
-    </div>
-
-    <div id="deviceUnlocked" class="hidden">
+    <div id="deviceUnlocked">
+      <input type="search" id="deviceSearchInput" class="filter-input" placeholder="Filter by IP, MAC, hostname or type…" oninput="rbRenderDeviceGrid()">
       <div class="row" style="margin-top:10px">
-        <button id="btnScanDevices" class="secondary" onclick="rbScanDevices()">Scan network</button>
-        <button class="secondary" onclick="rbLoadDevices()">Refresh</button>
-        <button class="secondary" onclick="rbLockDevices()">Lock</button>
+        <button id="btnScanDevices" class="secondary" onclick="rbOpenNetworkModal('devices'); rbScanDevices();">Scan all devices</button>
+        <button class="secondary" onclick="rbOpenNetworkModal('devices'); rbLoadDevices();">Refresh</button>
       </div>
       <div id="deviceCount" class="muted" style="margin-top:8px;font-size:12.5px"></div>
       <div id="deviceGrid" class="device-grid"><div class="device-empty">Loading…</div></div>
@@ -1315,13 +1775,20 @@ Click "Run server" to start — output streams here.
             <h3>Users connected locally</h3>
             <p class="muted" style="font-size:12px;margin:2px 0 0">All RemoteBridge users currently active on this LAN, merged with devices visible to this server.</p>
           </div>
-          <button class="secondary" type="button" onclick="rbLoadLocalUsers()">Refresh</button>
+          <button class="secondary" type="button" onclick="rbOpenNetworkModal('users'); rbLoadLocalUsers();">Refresh</button>
         </div>
+        <input type="search" id="userSearchInput" class="filter-input" placeholder="Filter by name, IP, MAC or Remote ID…" oninput="rbRenderLocalUsersGrid()" style="margin-top:10px">
         <div id="localUserCount" class="muted" style="margin-top:8px;font-size:12.5px"></div>
         <div id="localUsersGrid" class="local-users-grid"><div class="device-empty">Loading…</div></div>
       </div>
     </div>
   </div>
+  <?php else: ?>
+  <div class="card">
+    <h2>Devices on this network</h2>
+    <p class="muted" style="font-size:12.5px">Network discovery is restricted to administrators.</p>
+  </div>
+  <?php endif; ?>
 </aside>
 </div>
 <script>
@@ -1334,6 +1801,10 @@ async function checkHealth(){
   }catch(e){s.textContent='Server unavailable';}
 }
 checkHealth();
+async function rbLogout(){
+  try { await fetch(rbUrl('/api/auth/logout'), { method: 'POST' }); } catch (e) {}
+  window.location.href = RB_BASE + '/login.php';
+}
 function rbShowTab(which){
   document.getElementById('tabHost').classList.toggle('active', which==='host');
   document.getElementById('tabViewer').classList.toggle('active', which==='viewer');
@@ -1341,6 +1812,6 @@ function rbShowTab(which){
   document.getElementById('panelViewer').classList.toggle('hidden', which!=='viewer');
 }
 </script>
-<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260821-remote-console"></script>
+<script src="<?= htmlspecialchars($basePath) ?>/public/app.js?v=20260823-remote-fix"></script>
 </body>
 </html>

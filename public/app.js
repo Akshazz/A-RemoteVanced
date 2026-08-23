@@ -104,6 +104,63 @@ function rbCloseSetupModal() {
   }
 }
 
+/* -------------------- Navbar dropdowns (Network / Menu) -------------------- */
+
+function rbCloseNavDropdowns() {
+  document.querySelectorAll('.nav-dropdown-panel').forEach(p => p.classList.add('hidden'));
+  document.querySelectorAll('.nav-dropdown').forEach(d => d.classList.remove('open'));
+}
+
+function rbToggleNavDropdown(wrapperId, event) {
+  if (event) event.stopPropagation();
+  const wrapper = document.getElementById(wrapperId);
+  if (!wrapper) return;
+  const panel = wrapper.querySelector('.nav-dropdown-panel');
+  const willOpen = panel && panel.classList.contains('hidden');
+  rbCloseNavDropdowns();
+  if (willOpen) {
+    panel.classList.remove('hidden');
+    wrapper.classList.add('open');
+    if (wrapperId === 'navNetworkDropdown') { rbRenderDeviceGrid(); rbRenderLocalUsersGrid(); }
+  }
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.nav-dropdown')) rbCloseNavDropdowns();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') rbCloseNavDropdowns();
+});
+
+/* -------------------- Network devices modal -------------------- */
+
+function rbOpenNetworkModal(tab) {
+  rbCloseNavDropdowns();
+  const modal = document.getElementById('networkModal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  rbShowNetworkTab(tab || 'devices');
+  rbRenderDeviceGrid();
+  rbRenderLocalUsersGrid();
+}
+
+function rbCloseNetworkModal() {
+  const modal = document.getElementById('networkModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+function rbShowNetworkTab(which) {
+  const tabDevices = document.getElementById('networkTabDevices');
+  const tabUsers = document.getElementById('networkTabUsers');
+  const panelDevices = document.getElementById('networkPanelDevices');
+  const panelUsers = document.getElementById('networkPanelUsers');
+  if (!tabDevices || !tabUsers || !panelDevices || !panelUsers) return;
+  tabDevices.classList.toggle('active', which === 'devices');
+  tabUsers.classList.toggle('active', which === 'users');
+  panelDevices.classList.toggle('hidden', which !== 'devices');
+  panelUsers.classList.toggle('hidden', which !== 'users');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const savedMode = localStorage.getItem('rb_setup_mode');
   const detectedMode = rbIsPrivateHost(location.hostname) ? 'local' : 'internet';
@@ -112,123 +169,153 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 /* -------------------- Local network devices sidebar -------------------- */
-/* Reads this server's own ARP cache via /api/network/devices (local-machine
- * only, same as the agent endpoints) and is itself gated behind an access
- * code (checked server-side, session-based) before any device data loads. */
+/* Network discovery is available directly from the local application. The
+ * server performs the subnet sweep and returns the refreshed ARP/MAC table. */
 
 function rbEsc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+/* Tiles keep their own collapsed/expanded state across re-renders (the grid
+ * re-renders every ~10s from polling), tracked here by a stable per-item key. */
+let rbOpenDeviceTiles = new Set();
+let rbOpenUserTiles = new Set();
+
 function rbDeviceTile(d) {
   const name = rbEsc(d.hostname || ('Device ' + d.ip.split('.').pop()));
   const mac = rbEsc((d.mac || '').toUpperCase());
   const ip = rbEsc(d.ip);
+  const type = d.type ? `<div class="drow"><span>Type</span><span>${rbEsc(d.type)}</span></div>` : '';
+  const key = d.ip || name;
+  const open = rbOpenDeviceTiles.has(key) ? ' open' : '';
   return `<div class="device-tile">
     <div class="dname"><span class="dot"></span>${name}</div>
-    <div class="drow"><span>IP</span><span>${ip}</span></div>
-    <div class="drow"><span>MAC</span><span>${mac || 'unknown'}</span></div>
+    <details class="tile-details" data-tile-key="${rbEsc(key)}" ontoggle="rbTrackTileOpen(this, rbOpenDeviceTiles)"${open}>
+      <summary>Details</summary>
+      <div class="drow"><span>IP</span><span>${ip}</span></div>
+      <div class="drow"><span>MAC</span><span>${mac || 'unknown'}</span></div>
+      ${type}
+    </details>
   </div>`;
 }
 
-function rbShowDeviceLockState(unlocked) {
-  document.getElementById('deviceLocked').classList.toggle('hidden', unlocked);
-  document.getElementById('deviceUnlocked').classList.toggle('hidden', !unlocked);
+function rbTrackTileOpen(detailsEl, store) {
+  const key = detailsEl.dataset.tileKey;
+  if (!key) return;
+  if (detailsEl.open) store.add(key); else store.delete(key);
 }
 
-async function rbCheckDeviceLock() {
-  try {
-    const data = await rbApi('/api/network/status', { method: 'GET' });
-    rbShowDeviceLockState(!!data.unlocked);
-    if (data.unlocked) { rbLoadDevices(); rbLoadLocalUsers(); }
-  } catch (e) { rbShowDeviceLockState(false); }
+/* Each list (devices / local users) can be shown in up to three places at
+ * once: the sidebar card, the navbar "Network" dropdown, and the full
+ * "networkModal". We keep one cache per list and re-render every visible
+ * target — applying that target's own search filter — whenever the cache
+ * changes or a search box is typed into. */
+
+let rbDevicesCache = [];
+let rbLocalUsersCache = [];
+
+function rbFilterQuery(inputId) {
+  const el = document.getElementById(inputId);
+  return el ? el.value.trim().toLowerCase() : '';
 }
 
-async function rbUnlockDevices() {
-  const codeInput = document.getElementById('networkAccessCode');
-  const errEl = document.getElementById('networkUnlockError');
-  errEl.classList.add('hidden');
-  try {
-    await rbApi('/api/network/unlock', { method: 'POST', body: JSON.stringify({ code: codeInput.value.trim() }) });
-    codeInput.value = '';
-    rbShowDeviceLockState(true);
-    rbLoadDevices();
-    rbLoadLocalUsers();
-  } catch (e) {
-    errEl.textContent = e.message;
-    errEl.classList.remove('hidden');
+function rbMatchDevice(d, q) {
+  if (!q) return true;
+  return [d.ip, d.mac, d.hostname, d.type].some(v => v && String(v).toLowerCase().includes(q));
+}
+
+function rbMatchUser(u, q) {
+  if (!q) return true;
+  return [u.device_name, u.hostname, u.ip, u.mac, u.remote_id].some(v => v && String(v).toLowerCase().includes(q));
+}
+
+function rbRenderDeviceGrid() {
+  const targets = [
+    { gridId: 'deviceGrid', countId: 'deviceCount', searchId: 'deviceSearchInput' },
+    { gridId: 'deviceGridModal', countId: 'deviceCountModal', searchId: 'deviceSearchModal' },
+  ];
+  const total = rbDevicesCache.length;
+  targets.forEach(t => {
+    const grid = document.getElementById(t.gridId);
+    if (!grid) return;
+    const countEl = document.getElementById(t.countId);
+    const q = rbFilterQuery(t.searchId);
+    const filtered = rbDevicesCache.filter(d => rbMatchDevice(d, q));
+    if (countEl) {
+      countEl.textContent = !total
+        ? 'No devices currently visible'
+        : (q ? `${filtered.length} of ${total} device${total === 1 ? '' : 's'} match “${rbEsc(q)}”`
+              : `${total} device${total === 1 ? '' : 's'} visible`);
+    }
+    grid.innerHTML = filtered.length
+      ? filtered.map(rbDeviceTile).join('')
+      : (total
+          ? '<div class="device-empty">No devices match your filter.</div>'
+          : '<div class="device-empty">No active devices are currently visible. Click “Scan all devices” to refresh the LAN.</div>');
+  });
+  const badge = document.getElementById('navDeviceBadge');
+  if (badge) {
+    badge.textContent = total ? String(total) : '';
+    badge.classList.toggle('hidden', !total);
   }
+  const navCount = document.getElementById('navDeviceCount');
+  if (navCount) navCount.textContent = total ? `${total} device${total === 1 ? '' : 's'} visible` : 'No devices currently visible';
 }
 
-async function rbLockDevices() {
-  try { await rbApi('/api/network/lock', { method: 'POST' }); } catch (e) {}
-  rbShowDeviceLockState(false);
-  const grid = document.getElementById('localUsersGrid');
-  const count = document.getElementById('localUserCount');
-  if (grid) grid.innerHTML = '<div class="device-empty">Locked.</div>';
-  if (count) count.textContent = '';
+function rbShowDeviceError(message) {
+  ['deviceGrid', 'deviceGridModal'].forEach(id => {
+    const grid = document.getElementById(id);
+    if (grid) grid.innerHTML = `<div class="device-empty">${rbEsc(message)}</div>`;
+  });
+  ['deviceCount', 'deviceCountModal'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '';
+  });
+  const navCount = document.getElementById('navDeviceCount');
+  if (navCount) navCount.textContent = 'Unavailable';
 }
 
 async function rbLoadDevices() {
-  const grid = document.getElementById('deviceGrid');
-  const countEl = document.getElementById('deviceCount');
+  if (!document.getElementById('deviceGrid') && !document.getElementById('deviceGridModal')) return;
   try {
     const data = await rbApi('/api/network/devices', { method: 'GET' });
-    const devices = data.devices || [];
-    countEl.textContent = devices.length ? `${devices.length} device${devices.length === 1 ? '' : 's'} seen` : '';
-    grid.innerHTML = devices.length
-      ? devices.map(rbDeviceTile).join('')
-      : '<div class="device-empty">No devices in the ARP cache yet. Try "Scan network".</div>';
+    rbDevicesCache = data.devices || [];
+    rbRenderDeviceGrid();
   } catch (e) {
-    if (e.message === 'locked') { rbShowDeviceLockState(false); return; }
-    grid.innerHTML = `<div class="device-empty">${e.message}</div>`;
-    countEl.textContent = '';
+    rbShowDeviceError(e.message);
   }
 }
 
-let rbNetworkScanTimer = null;
-
 async function rbScanDevices() {
-  const btn = document.getElementById('btnScanDevices');
-  const grid = document.getElementById('deviceGrid');
-  if (!btn || btn.dataset.scanning === '1') return;
+  const btns = [document.getElementById('btnScanDevices'), document.getElementById('btnScanDevicesModal')].filter(Boolean);
+  if (!btns.length || btns[0].dataset.scanning === '1') return;
 
-  btn.dataset.scanning = '1';
-  btn.disabled = true;
-  btn.textContent = 'Scanning…';
-  if (grid) grid.innerHTML = '<div class="device-empty">Scanning the local network…</div>';
+  btns.forEach(btn => { btn.dataset.scanning = '1'; btn.disabled = true; btn.textContent = 'Scanning all devices…'; });
+  ['deviceGrid', 'deviceGridModal'].forEach(id => {
+    const grid = document.getElementById(id);
+    if (grid) grid.innerHTML = '<div class="device-empty">Scanning the detected local subnet. RemoteBridge remains usable while discovery runs…</div>';
+  });
 
   try {
-    // The server owns the scan and enforces a hard timeout. There is no
-    // browser polling loop and, importantly, no detached/background scanner.
     const result = await rbApi('/api/network/scan', { method: 'POST' });
-    const devices = result.devices || [];
-    const countEl = document.getElementById('deviceCount');
-    if (countEl) countEl.textContent = devices.length
-      ? `${devices.length} device${devices.length === 1 ? '' : 's'} seen`
-      : 'No devices detected';
-    if (grid) grid.innerHTML = devices.length
-      ? devices.map(rbDeviceTile).join('')
-      : '<div class="device-empty">No devices were detected on the local network.</div>';
+    rbDevicesCache = result.devices || [];
+    rbRenderDeviceGrid();
 
-    if (result.timed_out && grid) {
-      const note = document.createElement('div');
-      note.className = 'device-empty';
-      note.textContent = 'Scan stopped safely at the time limit. Partial results are shown.';
-      grid.appendChild(note);
+    if (result.timed_out) {
+      ['deviceGrid', 'deviceGridModal'].forEach(id => {
+        const grid = document.getElementById(id);
+        if (!grid) return;
+        const note = document.createElement('div');
+        note.className = 'device-empty';
+        note.textContent = result.message || 'The scan timed out; partial results are shown.';
+        grid.appendChild(note);
+      });
     }
     await rbLoadLocalUsers();
   } catch (e) {
-    if (e.message === 'locked') rbShowDeviceLockState(false);
-    else if (grid) grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
+    rbShowDeviceError(`Network scan failed: ${e.message} — make sure PHP is allowed to execute the local scanner and that this page is running on the same computer as the network you want to scan.`);
   } finally {
-    btn.disabled = false;
-    btn.dataset.scanning = '0';
-    btn.textContent = 'Scan network';
-    if (rbNetworkScanTimer) {
-      clearInterval(rbNetworkScanTimer);
-      rbNetworkScanTimer = null;
-    }
+    btns.forEach(btn => { btn.disabled = false; btn.dataset.scanning = '0'; btn.textContent = 'Scan all devices'; });
   }
 }
 
@@ -240,41 +327,187 @@ function rbLocalUserTile(u) {
   const remote = u.remote_id ? `<div class="uid">Remote ID: ${rbEsc(u.remote_id)} <button type="button" class="remote-copy-btn" onclick="rbCopyRemoteId('${rbEsc(u.remote_id)}', this)">Copy</button> ${me}</div>` : '<div class="uid">Local network device</div>';
   const host = u.hostname && u.hostname !== u.device_name ? ` · Host: ${rbEsc(u.hostname)}` : '';
   const seen = u.last_seen_at ? ` · Last seen: ${rbEsc(u.last_seen_at)}` : '';
+  const key = u.remote_id || u.ip || u.device_name || u.hostname;
+  const open = rbOpenUserTiles.has(key) ? ' open' : '';
   return `<div class="local-user-tile">
     <div class="uname"><span class="udot"></span>${rbEsc(u.device_name || u.hostname || 'Unknown device')}</div>
     ${remote}
-    <div class="umeta">IP: ${rbEsc(u.ip || 'Unknown')} · MAC: ${mac}${host}<br>Status: <strong>Online</strong>${seen}</div>
+    <details class="tile-details" data-tile-key="${rbEsc(key)}" ontoggle="rbTrackTileOpen(this, rbOpenUserTiles)"${open}>
+      <summary>Details</summary>
+      <div class="umeta">IP: ${rbEsc(u.ip || 'Unknown')} · MAC: ${mac}${host}<br>Status: <strong>Online</strong>${seen}</div>
+    </details>
   </div>`;
 }
 
+function rbRenderLocalUsersGrid() {
+  const targets = [
+    { gridId: 'localUsersGrid', countId: 'localUserCount', searchId: 'userSearchInput' },
+    { gridId: 'localUsersGridModal', countId: 'localUserCountModal', searchId: 'userSearchModal' },
+  ];
+  const total = rbLocalUsersCache.length;
+  targets.forEach(t => {
+    const grid = document.getElementById(t.gridId);
+    if (!grid) return;
+    const countEl = document.getElementById(t.countId);
+    const q = rbFilterQuery(t.searchId);
+    const filtered = rbLocalUsersCache.filter(u => rbMatchUser(u, q));
+    if (countEl) {
+      countEl.textContent = !total
+        ? 'No local network devices detected'
+        : (q ? `${filtered.length} of ${total} match “${rbEsc(q)}”`
+              : `${total} local network device${total === 1 ? '' : 's'} detected`);
+    }
+    grid.innerHTML = filtered.length
+      ? filtered.map(rbLocalUserTile).join('')
+      : (total
+          ? '<div class="device-empty">No devices match your filter.</div>'
+          : '<div class="device-empty">No devices are currently visible on this local network. Click Scan all devices to refresh the network.</div>');
+  });
+  const navUserCount = document.getElementById('navUserCount');
+  if (navUserCount) navUserCount.textContent = total ? `${total} local user${total === 1 ? '' : 's'} online` : 'No local users online';
+}
+
 async function rbLoadLocalUsers() {
-  const grid = document.getElementById('localUsersGrid');
-  const count = document.getElementById('localUserCount');
-  if (!grid || !count) return;
+  if (!document.getElementById('localUsersGrid') && !document.getElementById('localUsersGridModal')) return;
   try {
     const data = await rbApi('/api/network/users', { method: 'GET' });
-    const users = data.users || [];
-    count.textContent = users.length ? `${users.length} local network device${users.length === 1 ? '' : 's'} detected` : 'No local network devices detected';
-    grid.innerHTML = users.length ? users.map(rbLocalUserTile).join('') : '<div class="device-empty">No devices are currently visible on this local network. Click Scan network to refresh the ARP table.</div>';
+    rbLocalUsersCache = data.users || [];
+    rbRenderLocalUsersGrid();
   } catch (e) {
-    if (e.message === 'locked') {
-      grid.innerHTML = '<div class="device-empty">Unlock the network panel to view local users.</div>';
-      count.textContent = '';
-      return;
-    }
-    grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
-    count.textContent = '';
+    ['localUsersGrid', 'localUsersGridModal'].forEach(id => {
+      const grid = document.getElementById(id);
+      if (grid) grid.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
+    });
+    ['localUserCount', 'localUserCountModal'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = '';
+    });
   }
 }
 
 function rbStartLocalUsersPolling() {
   clearInterval(localUsersPollTimer);
+  rbLoadDevices();
   rbLoadLocalUsers();
-  localUsersPollTimer = setInterval(rbLoadLocalUsers, 10000);
+  localUsersPollTimer = setInterval(() => {
+    rbLoadDevices();
+    rbLoadLocalUsers();
+  }, 10000);
 }
 
-rbCheckDeviceLock().then?.(() => {});
 rbStartLocalUsersPolling();
+
+/* -------------------- Recent devices (this account, left sidebar) -------------------- */
+/* Every browser/computer that has registered a Remote ID under the logged-in
+ * account, most recently active first. Backed by /api/devices/recent (own
+ * devices only) and /api/devices/rename (own devices; admins may rename any
+ * device). This is separate from the LAN discovery grid above — it reflects
+ * *this account's* connection history, not what's physically visible on the
+ * subnet. */
+
+let rbRecentDevicesCache = [];
+let rbRecentDevicesEditing = null; // remote_id currently being renamed, or null
+let recentDevicesPollTimer = null;
+
+function rbRecentDeviceTile(d) {
+  const remoteId = String(d.remote_id);
+  const name = rbEsc(d.device_name || 'Unnamed device');
+  const isMe = remoteId === myRemoteId;
+  const online = !!d.is_online;
+  const meBadge = isMe ? '<span class="badge local" style="font-size:9px;padding:2px 6px;margin-left:4px">This device</span>' : '';
+  const status = online ? '<span class="rd-status">Online</span>' : (d.last_seen_at ? `Last seen ${rbEsc(d.last_seen_at)}` : 'Never connected');
+  const editing = rbRecentDevicesEditing === remoteId;
+
+  const renameRow = editing ? `
+    <div class="rd-rename-row">
+      <input type="text" id="rdRenameInput-${rbEsc(remoteId)}" maxlength="80" value="${rbEsc(d.device_name || '')}" placeholder="Device name"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();rbRenameDeviceSubmit('${rbEsc(remoteId)}');} if(event.key==='Escape'){event.preventDefault();rbRenameDeviceCancel();}">
+      <button class="secondary" type="button" onclick="rbRenameDeviceSubmit('${rbEsc(remoteId)}')">Save</button>
+      <button class="secondary" type="button" onclick="rbRenameDeviceCancel()">Cancel</button>
+    </div>
+    <div id="rdRenameError-${rbEsc(remoteId)}" class="rd-rename-error hidden"></div>` : '';
+
+  return `<div class="recent-device-tile">
+    <div class="rdname-row">
+      <div class="rdname${online ? ' online' : ''}"><span class="dot"></span><span class="rdname-text">${name}</span>${meBadge}</div>
+      <button type="button" class="rd-rename-btn" title="Rename this device" aria-label="Rename this device" onclick="rbRenameDeviceStart('${rbEsc(remoteId)}')">✎</button>
+    </div>
+    <div class="rdmeta">ID: ${rbEsc(remoteId)} &middot; IP: ${rbEsc(d.ip_address || 'Unknown')} &middot; ${status}</div>
+    ${renameRow}
+  </div>`;
+}
+
+function rbRenderRecentDevices() {
+  const list = document.getElementById('recentDeviceList');
+  if (!list) return;
+  const countEl = document.getElementById('recentDeviceCount');
+  const total = rbRecentDevicesCache.length;
+  if (countEl) countEl.textContent = total ? `${total} device${total === 1 ? '' : 's'}` : '';
+  list.innerHTML = total
+    ? rbRecentDevicesCache.map(rbRecentDeviceTile).join('')
+    : '<div class="device-empty">No devices yet — this fills in once you connect from a browser.</div>';
+  if (rbRecentDevicesEditing) {
+    const input = document.getElementById(`rdRenameInput-${rbRecentDevicesEditing}`);
+    if (input) { input.focus(); input.select(); }
+  }
+}
+
+async function rbLoadRecentDevices() {
+  if (!document.getElementById('recentDeviceList')) return;
+  try {
+    const data = await rbApi('/api/devices/recent', { method: 'GET' });
+    rbRecentDevicesCache = data.devices || [];
+    rbRenderRecentDevices();
+  } catch (e) {
+    const list = document.getElementById('recentDeviceList');
+    if (list) list.innerHTML = `<div class="device-empty">${rbEsc(e.message)}</div>`;
+    const countEl = document.getElementById('recentDeviceCount');
+    if (countEl) countEl.textContent = '';
+  }
+}
+
+function rbRenameDeviceStart(remoteId) {
+  rbRecentDevicesEditing = String(remoteId);
+  rbRenderRecentDevices();
+}
+
+function rbRenameDeviceCancel() {
+  rbRecentDevicesEditing = null;
+  rbRenderRecentDevices();
+}
+
+async function rbRenameDeviceSubmit(remoteId) {
+  const input = document.getElementById(`rdRenameInput-${remoteId}`);
+  const errEl = document.getElementById(`rdRenameError-${remoteId}`);
+  const name = input ? input.value.trim() : '';
+  if (!name) {
+    if (errEl) { errEl.textContent = 'Enter a device name.'; errEl.classList.remove('hidden'); }
+    return;
+  }
+  try {
+    const data = await rbApi('/api/devices/rename', {
+      method: 'POST',
+      body: JSON.stringify({ remote_id: remoteId, device_name: name }),
+    });
+    rbRecentDevicesEditing = null;
+    rbDeviceInfoCache.delete(remoteId); // cached device-info lookups may now be stale
+    rbLog(`Renamed device ${remoteId} to "${data.device_name}".`);
+    await rbLoadRecentDevices();
+  } catch (e) {
+    if (errEl) { errEl.textContent = e.message; errEl.classList.remove('hidden'); }
+  }
+}
+
+function rbStartRecentDevicesPolling() {
+  clearInterval(recentDevicesPollTimer);
+  rbLoadRecentDevices();
+  recentDevicesPollTimer = setInterval(() => {
+    if (rbRecentDevicesEditing) return; // don't yank focus out from under someone typing
+    rbLoadRecentDevices();
+  }, 15000);
+}
+
+rbStartRecentDevicesPolling();
 
 function rbLog(msg) {
   const el = document.getElementById('log');
@@ -284,9 +517,20 @@ function rbLog(msg) {
 }
 
 async function rbApi(path, opts) {
-  const res = await fetch(rbUrl(path), Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  const url = rbUrl(path);
+  const res = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } }, opts));
+  if (res.status === 401 && !path.startsWith('/api/auth/')) {
+    // Session expired or was never established — bounce to login rather
+    // than surfacing a confusing "Authentication required" error inline.
+    window.location.href = RB_BASE + '/login.php';
+    throw new Error('Authentication required');
+  }
+  const contentType = res.headers.get('content-type') || '';
+  const data = contentType.includes('application/json') ? await res.json().catch(() => ({})) : {};
+  if (!res.ok) {
+    const detail = data.error || (res.status === 404 ? `API route not found: ${url}` : `Request failed (${res.status})`);
+    throw new Error(detail);
+  }
   return data;
 }
 
@@ -478,6 +722,7 @@ async function rbInitIdentity() {
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       await rbEnsureRegistered();
+      rbLoadRecentDevices();
       return;
     } catch (e) {
       lastError = e;
@@ -615,7 +860,8 @@ function rbConnectAgent() {
         agentConnecting = false;
         agentConnected = true;
         agentConsoleEnabled = !!msg.console_enabled;
-        rbAgentStatus('Native control agent: connected');
+        rbAgentStatus('Native control agent: connected — remote mouse/keyboard ready');
+        rbLog('Native control agent connected. Remote mouse/keyboard control is ready.');
         rbUpdateConsoleAvailability();
       } else if (msg.type === 'auth_fail') {
         if (agentSocket !== socket) return;
@@ -678,7 +924,10 @@ function rbExtractAgentToken() {
   tokenEl.value = token;
   localStorage.setItem('rb_agent_token', token);
   rbSetAgentTokenState(token);
-  rbAgentStatus('Complete token read from command-line output. Click Connect to authenticate.');
+  rbAgentStatus('Agent token detected. Connecting…');
+  // Starting the local agent should finish the setup automatically. The
+  // explicit Connect button remains available for manual/re-authentication.
+  setTimeout(() => rbConnectAgent(), 50);
   return token;
 }
 
@@ -783,7 +1032,9 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('agentToken').value = savedAgentToken;
     rbSetAgentTokenState(savedAgentToken);
   }
-  rbLoadAgentConfig();
+  rbLoadAgentConfig().then(() => {
+    if (savedAgentToken && /^[A-Za-z0-9_-]{32,128}$/.test(savedAgentToken)) rbConnectAgent();
+  });
   // Also recover a token if the agent console was populated by a restored
   // page state before this script finishes initializing.
   rbExtractAgentToken();
@@ -792,8 +1043,17 @@ document.addEventListener('DOMContentLoaded', () => {
 function rbForwardControlToAgent(cmd) {
   const allow = document.getElementById('allowControl')?.checked;
   if (!allow) return; // host has not granted control permission
-  if (!agentConnected || !agentSocket || agentSocket.readyState !== WebSocket.OPEN) return;
-  agentSocket.send(JSON.stringify(cmd));
+  if (!agentConnected || !agentSocket || agentSocket.readyState !== WebSocket.OPEN) {
+    // Do not spam the log for every mousemove. The status badge already shows
+    // the actual agent state; one warning is enough for a disconnected host.
+    if (!rbForwardControlToAgent.warned) {
+      rbForwardControlToAgent.warned = true;
+      rbLog('Remote control is enabled, but the native control agent is not connected. Start the agent and click Connect.');
+    }
+    return;
+  }
+  rbForwardControlToAgent.warned = false;
+  try { agentSocket.send(JSON.stringify(cmd)); } catch (_) {}
 }
 
 /* ------------------------- Remote console (host side) ------------------------- */
@@ -914,6 +1174,19 @@ function rbRenderConnectedViewers() {
 }
 
 async function rbAcceptSession(sessionId, initiatorId, deviceInfo) {
+  // Chrome/Edge require screen capture to run in a secure context. localhost
+  // is allowed, but an ordinary http://192.168.x.x page is not. Give the host
+  // a precise message instead of silently leaving the request pending.
+  if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1' && location.hostname !== '::1') {
+    rbLog('Remote access cannot start from an insecure HTTP page. Open this host page over HTTPS (or localhost for local testing).');
+    alert('Remote access needs HTTPS on the host computer. Open RemoteBridge over https://, or use http://localhost when the host and server are the same computer.');
+    return;
+  }
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+    rbLog('This browser does not provide screen capture. Use a current Chrome or Edge browser.');
+    alert('Screen capture is unavailable in this browser. Please use current Chrome or Edge.');
+    return;
+  }
   try {
     hostStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
   } catch (e) {

@@ -1,140 +1,334 @@
 <?php
 declare(strict_types=1);
 
-session_start();
-require dirname(__DIR__) . '/database.php';
-$config = require dirname(__DIR__) . '/config.php';
+function h(string $v): string { return htmlspecialchars($v, ENT_QUOTES, 'UTF-8'); }
+$base = rtrim(dirname(dirname($_SERVER['SCRIPT_NAME'] ?? '/')), '/');
 
-function rb_admin_local_only(): void {
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
-    if (!in_array($ip, ['127.0.0.1', '::1'], true)) {
-        http_response_code(403);
-        header('Content-Type: text/html; charset=utf-8');
-        echo '<!doctype html><title>Admin settings unavailable</title><body style="font-family:system-ui;background:#07111f;color:#eaf1ff;padding:40px"><h1>Admin settings are local-only</h1><p>Open this page from the same computer running the RemoteBridge PHP server.</p></body>';
-        exit;
-    }
-}
-rb_admin_local_only();
-
-$db = null;
-$error = '';
-$success = '';
-$generatedCode = null;
-
-try {
-    $db = db();
-    $db->query("CREATE TABLE IF NOT EXISTS app_settings (
-        setting_key VARCHAR(100) NOT NULL PRIMARY KEY,
-        setting_value TEXT NULL,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-} catch (Throwable $e) {
-    $error = 'Database is unavailable. Run database/migrate.php first, then reload this page.';
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'httponly' => true, 'samesite' => 'Lax']);
+    session_start();
 }
 
-function rb_setting(mysqli $db, string $key): ?string {
-    $stmt = $db->prepare('SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1');
-    $stmt->bind_param('s', $key);
-    $stmt->execute();
-    $row = $stmt->get_result()->fetch_assoc();
-    $stmt->close();
-    return is_array($row) && array_key_exists('setting_value', $row) ? (string)$row['setting_value'] : null;
+if (empty($_SESSION['user_id'])) {
+    header('Location: ' . $base . '/login.php');
+    exit;
 }
 
-function rb_save_setting(mysqli $db, string $key, string $value): void {
-    $stmt = $db->prepare('INSERT INTO app_settings(setting_key, setting_value) VALUES(?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)');
-    $stmt->bind_param('ss', $key, $value);
-    $stmt->execute();
-    $stmt->close();
+if (($_SESSION['role'] ?? '') !== 'admin') {
+    http_response_code(403);
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><title>Admin access required</title>'
+       . '<body style="font-family:system-ui;background:#07111f;color:#eaf1ff;padding:40px">'
+       . '<h1>Admin access required</h1><p>Only administrators can view this page.</p>'
+       . '<p><a href="' . h($base . '/index.php') . '" style="color:#8fb4ff">Back to RemoteBridge</a></p></body>';
+    exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && $db instanceof mysqli && $error === '') {
-    $action = (string)($_POST['action'] ?? 'save');
-    try {
-        if ($action === 'generate') {
-            $code = bin2hex(random_bytes(8));
-            rb_save_setting($db, 'network_access_code', $code);
-            $generatedCode = $code;
-            $success = 'A new Network Access Code was generated and saved. Use the code shown below to unlock the network device panel.';
-        } else {
-            $code = trim((string)($_POST['network_access_code'] ?? ''));
-            if ($code === '') {
-                throw new RuntimeException('Enter a Network Access Code, or use Generate new code.');
-            }
-            if (strlen($code) < 6 || strlen($code) > 128) {
-                throw new RuntimeException('The Network Access Code must be between 6 and 128 characters.');
-            }
-            rb_save_setting($db, 'network_access_code', $code);
-            $success = 'Network Access Code saved successfully.';
-        }
-    } catch (Throwable $e) {
-        $error = $e->getMessage();
-    }
-}
-
-$current = ($db instanceof mysqli && $error === '') ? rb_setting($db, 'network_access_code') : null;
-$hasCode = is_string($current) && $current !== '';
-$fallbackConfigured = !empty($config['network']['access_code']);
-$base = rtrim(str_replace('\\', '/', dirname(dirname($_SERVER['SCRIPT_NAME'] ?? '/admin/settings.php'))), '/');
-if ($base === '/' || $base === '.') $base = '';
-function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); }
+$currentUsername = (string)($_SESSION['username'] ?? '');
+$currentDisplayName = (string)($_SESSION['display_name'] ?? $currentUsername);
 ?>
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RemoteBridge — Admin Settings</title>
+<title>RemoteBridge — Admin</title>
 <style>
-:root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:#07111f;color:#eaf1ff}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#10243f 0,#07111f 48%,#050b14 100%);min-height:100vh}
-.nav{height:68px;border-bottom:1px solid #1b304c;background:#09172a;display:flex;align-items:center;justify-content:space-between;padding:0 24px;gap:15px}.brand{font-weight:800;font-size:18px}.sub{display:block;font-size:11px;color:#8297b5;font-weight:500;margin-top:2px}.nav a{color:#cfe0f7;text-decoration:none;border:1px solid #2c4262;border-radius:9px;padding:8px 12px;font-size:12.5px;font-weight:700}.nav a:hover{background:#0e1b2f;border-color:#3a5680}
-.wrap{max-width:900px;margin:40px auto;padding:0 20px}.card{background:#0d1d32;border:1px solid #253b5a;border-radius:18px;padding:24px;box-shadow:0 24px 70px rgba(0,0,0,.28)}h1{font-size:24px;margin:0 0 7px}h2{font-size:16px;margin:0 0 8px}.muted{color:#9db0ca;line-height:1.55;font-size:13px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.field{margin-top:22px}.label{display:block;font-size:13px;font-weight:700;margin-bottom:8px}input{width:100%;height:46px;background:#071321;border:1px solid #2a4364;border-radius:10px;color:#eaf1ff;padding:0 13px;font:600 14px ui-monospace,SFMono-Regular,Consolas,monospace;outline:none}input:focus{border-color:#3f82ff;box-shadow:0 0 0 3px rgba(63,130,255,.14)}button{height:42px;border:0;border-radius:10px;background:#2b6de8;color:#fff;font-weight:800;padding:0 16px;cursor:pointer}button.secondary{background:#172b46;border:1px solid #2c4262;color:#cfe0f7}button:hover{filter:brightness(1.08)}.status{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:12px;background:#102b1d;border:1px solid #2f6b45;color:#75e5a0}.warn{background:#352816;border-color:#815827;color:#f2c58a}.notice{margin-top:16px;padding:12px 14px;border-radius:10px;background:#091727;border:1px solid #1b304c;font-size:12.5px;color:#a9c3ff}.ok{border-color:#2f6b45;color:#8fe3a3;background:#0d2419}.err{border-color:#815827;color:#f2c58a;background:#281b0d}.generated{margin-top:16px;padding:14px;border:1px solid #355985;border-radius:12px;background:#0a192c}.generated>div:first-child{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}.generated strong{display:block;font-size:13px}.generated span,.generated small{color:#9db0ca;font-size:12px}.generated-row{display:flex;gap:10px;margin-top:10px}.generated-row input{flex:1;min-width:0}.generated-row button{flex:0 0 auto}.divider{height:1px;background:#1b304c;margin:24px 0}.meta{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}.meta div{background:#091727;border:1px solid #1b304c;border-radius:10px;padding:11px}.meta strong{display:block;font-size:11px;color:#7f95b4;margin-bottom:4px}.meta span{font-size:12.5px}@media(max-width:650px){.meta{grid-template-columns:1fr}.wrap{margin:20px auto}.nav{padding:0 14px}.sub{display:none}}
-@media(max-width:650px){.generated-row{flex-direction:column}.generated-row button{width:100%}}
+:root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eaf1ff;background:#07101f}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(circle at 20% 10%,#15315a 0,#07101f 42%,#050a13 100%)}
+.nav{height:64px;border-bottom:1px solid #1c304b;background:rgba(8,20,37,.92);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:space-between;padding:0 28px;position:sticky;top:0;z-index:50}
+.nav-left{display:flex;align-items:center;gap:14px}
+.brand{font-weight:800;font-size:16px}
+.sub,.muted{color:#9db0ca;font-size:13px}
+.nav a.back{color:#bcd3f2;text-decoration:none;font-size:13.5px}
+.nav a.back:hover{color:#fff}
+.avatar{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#2b6de8,#7b3fe4);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12.5px;color:#fff;flex-shrink:0}
+.who{display:flex;align-items:center;gap:9px}
+.who .name{font-size:13px;font-weight:700}
+.badge{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.3px;padding:2px 8px;border-radius:999px;border:1px solid #2c4262;background:#1e2e50;color:#a9c3ff}
+
+.wrap{max-width:1000px;margin:32px auto 60px;padding:0 20px}
+.card{border:1px solid #253b5a;border-radius:16px;background:rgba(14,27,47,.88);padding:26px;box-shadow:0 18px 60px rgba(0,0,0,.25);margin-bottom:20px}
+h1{margin:0 0 4px;font-size:24px}
+h2{font-size:16px;margin:0 0 6px}
+p.lead{color:#9db0ca;margin:0 0 22px;font-size:14px}
+
+.tabs{display:flex;gap:8px;margin-bottom:22px;flex-wrap:wrap}
+.tab{padding:9px 16px;border-radius:10px;background:#0e1b2f;border:1px solid #253b5a;color:#cfe0f7;cursor:pointer;font-weight:600;font-size:13.5px}
+.tab.active{background:#2b6de8;border-color:#2b6de8;color:#fff}
+.panel{display:none}
+.panel.active{display:block}
+
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;color:#7f95b4;font-size:11px;letter-spacing:.4px;text-transform:uppercase;padding:8px 10px;border-bottom:1px solid #1e3049}
+td{padding:10px;border-bottom:1px solid #16273f;vertical-align:middle}
+tr:last-child td{border-bottom:0}
+.role-pill{display:inline-block;font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:999px;border:1px solid #2c4262}
+.role-pill.admin{background:#1e2e50;border-color:#3a56a0;color:#a9c3ff}
+.role-pill.user{background:#173822;border-color:#2f6b45;color:#8fe3a3}
+.state-pill{display:inline-block;font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:999px}
+.state-pill.active{background:#173822;color:#8fe3a3}
+.state-pill.inactive{background:#3a1414;color:#f29a9a}
+
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+input,select{height:42px;padding:0 12px;border-radius:9px;border:1px solid #253b5a;background:#07101c;color:#eaf1ff;font-size:13.5px;outline:none}
+input:focus,select:focus{border-color:#3a6fbb;box-shadow:0 0 0 2px rgba(43,109,232,.18)}
+label{display:block;font-size:11.5px;font-weight:700;color:#9db0ca;margin-bottom:5px}
+.field{min-width:160px;flex:1}
+button{border:0;border-radius:9px;padding:10px 15px;background:#2b6de8;color:#fff;font-weight:700;cursor:pointer;font-size:13px}
+button.secondary{background:#20324d}
+button.danger{background:#a83a2f}
+button.small{padding:6px 11px;font-size:12px}
+button:disabled{opacity:.5;cursor:not-allowed}
+.actions{display:flex;gap:6px;flex-wrap:wrap}
+.add-user-form{margin-top:18px;padding-top:18px;border-top:1px solid #1e3049}
+.msg{margin-top:12px;padding:10px 12px;border-radius:10px;font-size:13px;display:none}
+.msg.ok{background:#0f2a1c;border:1px solid #2f6b45;color:#8fe3a3;display:block}
+.msg.error{background:#281b0d;border:1px solid #815827;color:#f2c58a;display:block}
+.meta{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}
+.meta div{background:#091727;border:1px solid #1b304c;border-radius:10px;padding:12px}
+.meta strong{display:block;font-size:11px;color:#7f95b4;margin-bottom:4px}
+.meta span{font-size:12.5px}
+.notice{border:1px solid #31557d;background:#0b1c31;border-radius:12px;padding:14px;margin-top:18px;color:#c8d7ea;font-size:13.5px}
+.log-line{font-family:ui-monospace,monospace;font-size:12px;padding:9px 10px;border-bottom:1px solid #16273f;color:#9db0ca}
+.log-line .ev{color:#cfe0f7;font-weight:700}
+.log-line .ip{color:#7f95b4}
+.empty{color:#7f95b4;font-size:13px;padding:14px 4px}
+.modal-overlay{position:fixed;inset:0;background:rgba(3,8,16,.7);display:flex;align-items:center;justify-content:center;z-index:100}
+.modal-overlay.hidden{display:none}
+.modal-box{background:#0d1d32;border:1px solid #253b5a;border-radius:16px;padding:26px;width:100%;max-width:360px}
+.modal-box h3{margin:0 0 14px}
+@media(max-width:650px){.meta{grid-template-columns:1fr}.nav{padding:0 14px}.sub{display:none}.who .name{display:none}table{font-size:12px}th:nth-child(4),td:nth-child(4){display:none}}
 </style>
 </head>
 <body>
-<header class="nav"><div><div class="brand">RemoteBridge</div><span class="sub">Administration / Network security</span></div><a href="<?=h($base . '/index.php')?>">← Back to RemoteBridge</a></header>
-<main class="wrap">
-<section class="card">
-<h1>Admin Settings</h1>
-<p class="muted">Configure the <strong>Network Access Code</strong> used to unlock <em>Devices on this network</em>. Changes are stored in the RemoteBridge database, so you no longer need to edit <code>config.php</code>.</p>
-<?php if ($success): ?><div class="notice ok"><?=h($success)?></div><?php endif; ?>
-<?php if ($generatedCode !== null): ?>
-<div class="generated" aria-live="polite">
-  <div><strong>Generated Network Access Code</strong><span>Use this code in <em>Devices on this network</em>.</span></div>
-  <div class="generated-row">
-    <input id="generated_code" type="text" readonly value="<?=h($generatedCode)?>" aria-label="Generated Network Access Code">
-    <button type="button" id="copy_generated">Copy code</button>
+<header class="nav">
+  <div class="nav-left">
+    <div class="brand">RemoteBridge</div>
+    <span class="sub">Admin</span>
   </div>
-  <small>This code is shown now because it was just generated. Keep it private.</small>
-</div>
-<?php endif; ?>
-<?php if ($error): ?><div class="notice err"><?=h($error)?></div><?php endif; ?>
-<div class="meta">
-  <div><strong>STORAGE</strong><span><?= $hasCode ? 'Database setting' : ($fallbackConfigured ? 'config.php / environment fallback' : 'Generated fallback') ?></span></div>
-  <div><strong>ACCESS</strong><span>Local computer only</span></div>
-  <div><strong>STATUS</strong><span class="status"><?= $hasCode ? 'Configured' : 'Fallback active' ?></span></div>
-</div>
-<div class="field">
-  <label class="label" for="network_access_code">Network Access Code</label>
-  <form method="post" class="row" autocomplete="off">
-    <input id="network_access_code" name="network_access_code" type="password" minlength="6" maxlength="128" placeholder="Enter a new access code" value="">
-    <button type="submit" name="action" value="save">Save code</button>
-    <button type="submit" name="action" value="generate" class="secondary">Generate new code</button>
-  </form>
-  <p class="muted">For security, the currently saved code is never displayed on this page. Saving or generating a code replaces the previous database value.</p>
-</div>
-<div class="divider"></div>
-<h2>How to use it</h2>
-<p class="muted">After saving, return to the main page, open <strong>Devices on this network</strong>, enter the new code, and click <strong>Unlock</strong>. Existing unlocked browser sessions remain unlocked until you click Lock or the session expires.</p>
-<div class="notice">This admin settings page is intentionally <strong>localhost-only</strong> because changing the network access code controls access to IP/MAC discovery data. Open it on the same PC that runs PHP/XAMPP.</div>
-</section>
+  <div class="row" style="gap:16px">
+    <div class="who">
+      <div class="avatar"><?= h(strtoupper(substr($currentDisplayName, 0, 1))) ?></div>
+      <span class="name"><?= h($currentDisplayName) ?></span>
+      <span class="badge">admin</span>
+    </div>
+    <a class="back" href="<?= h($base . '/index.php') ?>">← Back to RemoteBridge</a>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card">
+    <h1>Administration</h1>
+    <p class="lead">Manage accounts, review activity, and see how network discovery works.</p>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="users" onclick="rbShowAdminTab('users')">Users</div>
+      <div class="tab" data-tab="audit" onclick="rbShowAdminTab('audit')">Audit log</div>
+      <div class="tab" data-tab="network" onclick="rbShowAdminTab('network')">Network discovery</div>
+    </div>
+
+    <div id="panel-users" class="panel active">
+      <table>
+        <thead>
+          <tr><th>User</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr>
+        </thead>
+        <tbody id="usersBody"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+      </table>
+
+      <div class="add-user-form">
+        <h2>Add a user</h2>
+        <form id="createUserForm">
+          <div class="row">
+            <div class="field">
+              <label for="newUsername">Username</label>
+              <input type="text" id="newUsername" required autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="newDisplayName">Display name</label>
+              <input type="text" id="newDisplayName" autocomplete="off">
+            </div>
+            <div class="field" style="max-width:140px">
+              <label for="newRole">Role</label>
+              <select id="newRole">
+                <option value="user">User</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="newPassword">Password</label>
+              <input type="text" id="newPassword" required minlength="8" placeholder="min 8 characters">
+            </div>
+            <button type="submit" style="align-self:flex-end;height:42px">Create user</button>
+          </div>
+        </form>
+        <div id="createUserMsg" class="msg"></div>
+      </div>
+    </div>
+
+    <div id="panel-audit" class="panel">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <p class="muted" style="margin:0">Most recent 100 events — logins, device registration, and network scans.</p>
+        <button class="secondary small" onclick="rbLoadAuditLog()">Refresh</button>
+      </div>
+      <div id="auditBody"><div class="empty">Loading…</div></div>
+    </div>
+
+    <div id="panel-network" class="panel">
+      <h2>Network Discovery</h2>
+      <p class="muted">Devices on the local network can be discovered directly from the main RemoteBridge page — admins only.</p>
+      <div class="meta">
+        <div><strong>ACCESS</strong><span>Admin role required</span></div>
+        <div><strong>DISCOVERY</strong><span>Full detected subnet sweep</span></div>
+        <div><strong>RESULTS</strong><span>IP, MAC and hostname when available</span></div>
+      </div>
+      <h2 style="margin-top:22px">How it works</h2>
+      <p class="muted">Click <strong>Scan all devices</strong> in the Devices on this network panel (visible to admins). RemoteBridge detects the server's local IPv4 subnet, probes the available host range, refreshes the server's ARP table, and displays the devices it can see.</p>
+      <div class="notice"><strong>Restricted to admins and to the machine running the PHP server.</strong> The discovery API checks both the logged-in user's role and that the request originates from the same LAN as the server.</div>
+    </div>
+  </section>
 </main>
+
+<div id="resetPwModal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <h3>Reset password</h3>
+    <p class="muted" id="resetPwFor" style="margin-top:-8px"></p>
+    <div class="field" style="margin-bottom:14px">
+      <label for="resetPwValue">New password</label>
+      <input type="text" id="resetPwValue" style="width:100%" minlength="8" placeholder="min 8 characters">
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="secondary" type="button" onclick="rbCloseResetModal()">Cancel</button>
+      <button type="button" onclick="rbSubmitResetPassword()">Set password</button>
+    </div>
+    <div id="resetPwMsg" class="msg"></div>
+  </div>
+</div>
+
 <script>
-const copyBtn=document.getElementById('copy_generated');
-const generated=document.getElementById('generated_code');
-if(copyBtn&&generated){copyBtn.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(generated.value);copyBtn.textContent='Copied';setTimeout(()=>copyBtn.textContent='Copy code',1600)}catch(e){generated.focus();generated.select();document.execCommand('copy');copyBtn.textContent='Copied';setTimeout(()=>copyBtn.textContent='Copy code',1600)}})}
+const RB_BASE = <?= json_encode($base, JSON_UNESCAPED_SLASHES) ?>;
+const RB_CURRENT_USERNAME = <?= json_encode($currentUsername) ?>;
+function rbUrl(p){ return RB_BASE + p; }
+
+async function rbApi(path, opts) {
+  const res = await fetch(rbUrl(path), Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  if (res.status === 401) { window.location.href = RB_BASE + '/login.php'; throw new Error('Authentication required'); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+function rbShowAdminTab(name){
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+  if (name === 'audit') rbLoadAuditLog();
+}
+
+function rbEsc(s){ const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+
+function rbUserRow(u){
+  const isSelf = u.username === RB_CURRENT_USERNAME;
+  const lastLogin = u.last_login_at ? rbEsc(u.last_login_at) : '—';
+  return `<tr>
+    <td><strong>${rbEsc(u.display_name || u.username)}</strong><br><span class="muted">@${rbEsc(u.username)}${isSelf ? ' (you)' : ''}</span></td>
+    <td><span class="role-pill ${u.role}">${rbEsc(u.role)}</span></td>
+    <td><span class="state-pill ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? 'Active' : 'Disabled'}</span></td>
+    <td class="muted">${lastLogin}</td>
+    <td>
+      <div class="actions">
+        <button class="secondary small" type="button" onclick="rbOpenResetModal(${u.id}, '${rbEsc(u.username)}')">Reset password</button>
+        <button class="secondary small" type="button" ${isSelf ? 'disabled title="You can\'t change your own role"' : ''} onclick="rbToggleRole(${u.id}, '${u.role}')">${u.role === 'admin' ? 'Make user' : 'Make admin'}</button>
+        <button class="danger small" type="button" ${isSelf ? 'disabled title="You can\'t disable your own account"' : ''} onclick="rbToggleActive(${u.id}, ${u.is_active ? 'true' : 'false'})">${u.is_active ? 'Disable' : 'Enable'}</button>
+      </div>
+    </td>
+  </tr>`;
+}
+
+async function rbLoadUsers(){
+  const body = document.getElementById('usersBody');
+  try {
+    const data = await rbApi('/api/admin/users', { method: 'GET' });
+    body.innerHTML = data.users.length ? data.users.map(rbUserRow).join('') : '<tr><td colspan="5" class="empty">No users found.</td></tr>';
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="5" class="empty">${rbEsc(e.message)}</td></tr>`;
+  }
+}
+
+async function rbToggleRole(id, currentRole){
+  const role = currentRole === 'admin' ? 'user' : 'admin';
+  try { await rbApi('/api/admin/users/update', { method: 'POST', body: JSON.stringify({ id, role }) }); await rbLoadUsers(); }
+  catch (e) { alert(e.message); }
+}
+
+async function rbToggleActive(id, currentlyActive){
+  try { await rbApi('/api/admin/users/update', { method: 'POST', body: JSON.stringify({ id, is_active: !currentlyActive }) }); await rbLoadUsers(); }
+  catch (e) { alert(e.message); }
+}
+
+let resetPwUserId = null;
+function rbOpenResetModal(id, username){
+  resetPwUserId = id;
+  document.getElementById('resetPwFor').textContent = 'For @' + username;
+  document.getElementById('resetPwValue').value = '';
+  document.getElementById('resetPwMsg').className = 'msg';
+  document.getElementById('resetPwModal').classList.remove('hidden');
+}
+function rbCloseResetModal(){ document.getElementById('resetPwModal').classList.add('hidden'); }
+async function rbSubmitResetPassword(){
+  const msg = document.getElementById('resetPwMsg');
+  const password = document.getElementById('resetPwValue').value;
+  try {
+    await rbApi('/api/admin/users/reset-password', { method: 'POST', body: JSON.stringify({ id: resetPwUserId, password }) });
+    msg.textContent = 'Password updated.';
+    msg.className = 'msg ok';
+    setTimeout(rbCloseResetModal, 900);
+  } catch (e) {
+    msg.textContent = e.message;
+    msg.className = 'msg error';
+  }
+}
+
+document.getElementById('createUserForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('createUserMsg');
+  const payload = {
+    username: document.getElementById('newUsername').value.trim(),
+    display_name: document.getElementById('newDisplayName').value.trim(),
+    role: document.getElementById('newRole').value,
+    password: document.getElementById('newPassword').value,
+  };
+  try {
+    await rbApi('/api/admin/users/create', { method: 'POST', body: JSON.stringify(payload) });
+    msg.textContent = 'User created.';
+    msg.className = 'msg ok';
+    e.target.reset();
+    await rbLoadUsers();
+  } catch (err) {
+    msg.textContent = err.message;
+    msg.className = 'msg error';
+  }
+});
+
+function rbAuditLine(entry){
+  let details = '';
+  if (entry.details) {
+    try { details = ' — ' + Object.entries(JSON.parse(entry.details)).map(([k,v]) => `${k}=${v}`).join(', '); } catch (e) {}
+  }
+  return `<div class="log-line"><span class="ev">${rbEsc(entry.event_type)}</span> · ${rbEsc(entry.created_at)} · <span class="ip">${rbEsc(entry.ip_address || '—')}</span>${rbEsc(details)}</div>`;
+}
+
+async function rbLoadAuditLog(){
+  const body = document.getElementById('auditBody');
+  body.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const data = await rbApi('/api/admin/audit-log?limit=100', { method: 'GET' });
+    body.innerHTML = data.entries.length ? data.entries.map(rbAuditLine).join('') : '<div class="empty">No audit events yet.</div>';
+  } catch (e) {
+    body.innerHTML = `<div class="empty">${rbEsc(e.message)}</div>`;
+  }
+}
+
+rbLoadUsers();
 </script>
-</body>
-</html>
+</body></html>
