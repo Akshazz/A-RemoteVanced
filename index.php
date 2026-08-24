@@ -1255,7 +1255,11 @@ $rbCurrentUser = rb_get_current_user();
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="RemoteBridge — web-based remote desktop over WebRTC">
-<title>RemoteBridge</title>
+<title> ARV Control System </title>
+<link rel="icon" type="image/x-icon" href="logo/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="logo/favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="logo/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="logo/apple-touch-icon-180.png">
 <style>
 :root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eaf1ff;background:#07101f;--navbar-h:64px;--sb-left:300px;--sb-right:320px}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;padding-top:var(--navbar-h);background:radial-gradient(circle at 20% 10%,#15315a 0,#07101f 42%,#050a13 100%)}

@@ -32,7 +32,11 @@ $currentDisplayName = (string)($_SESSION['display_name'] ?? $currentUsername);
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RemoteBridge — Admin</title>
+<title> ARV Control System | Admin Panel </title>
+<link rel="icon" type="image/x-icon" href="../logo/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="../logo/favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="../logo/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="../logo/apple-touch-icon-180.png">
 <style>
 :root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eaf1ff;background:#07101f}
 *{box-sizing:border-box}

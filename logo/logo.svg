@@ -1,0 +1,29 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="strokeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#82b6ff"/>
+      <stop offset="100%" stop-color="#4a8bf5"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="512" height="512" rx="115" ry="115" fill="#0e1a2b"/>
+
+  <g fill="none" stroke="url(#strokeGrad)" stroke-linecap="round">
+    <path d="M 204 370 A 60 60 0 0 1 308 370" stroke-width="24"/>
+    <path d="M 152 340 A 120 120 0 0 1 360 340" stroke-width="24" opacity="0.88"/>
+    <path d="M 100 310 A 180 180 0 0 1 412 310" stroke-width="24" opacity="0.72"/>
+  </g>
+
+  <!-- joint rings at each arc end, matching the reference's node style -->
+  <g fill="#0e1a2b" stroke="url(#strokeGrad)" stroke-width="10">
+    <circle cx="204" cy="370" r="14"/>
+    <circle cx="308" cy="370" r="14"/>
+    <circle cx="152" cy="340" r="13" opacity="0.88"/>
+    <circle cx="360" cy="340" r="13" opacity="0.88"/>
+    <circle cx="100" cy="310" r="12" opacity="0.72"/>
+    <circle cx="412" cy="310" r="12" opacity="0.72"/>
+  </g>
+
+  <!-- central device node -->
+  <circle cx="256" cy="400" r="32" fill="#0e1a2b" stroke="url(#strokeGrad)" stroke-width="17"/>
+</svg>
