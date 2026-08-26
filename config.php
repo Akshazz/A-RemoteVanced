@@ -40,6 +40,24 @@ return [
         'port' => (int)(getenv('RB_AGENT_PORT') ?: 8791),
     ],
 
+    /* Security Lab / VMware integration. All actions are admin-only and
+     * limited to explicitly authorized scopes. Configure via environment
+     * variables; do not commit guest passwords or private keys. */
+    'security_lab' => [
+        'enabled' => filter_var(getenv('RB_SECURITY_LAB_ENABLED') ?: '0', FILTER_VALIDATE_BOOLEAN),
+        'vmrun' => getenv('RB_VMWARE_VMRUN') ?: '',
+        'vmx' => getenv('RB_KALI_VMX') ?: '',
+        'guest_user' => getenv('RB_KALI_GUEST_USER') ?: 'kali',
+        'guest_password' => getenv('RB_KALI_GUEST_PASSWORD') ?: '',
+        'ssh_host' => getenv('RB_KALI_SSH_HOST') ?: '127.0.0.1',
+        'ssh_port' => (int)(getenv('RB_KALI_SSH_PORT') ?: 22),
+        'ssh_user' => getenv('RB_KALI_SSH_USER') ?: 'kali',
+        'ssh_key' => getenv('RB_KALI_SSH_KEY') ?: '',
+        'nmap' => getenv('RB_KALI_NMAP') ?: '/usr/bin/nmap',
+        'nikto' => getenv('RB_KALI_NIKTO') ?: '/usr/bin/nikto',
+        'timeout' => (int)(getenv('RB_SECURITY_LAB_TIMEOUT') ?: 45),
+    ],
+
     'session_ttl' => 300,
     'max_signal_bytes' => 262144,
 

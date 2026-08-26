@@ -14,3 +14,11 @@
 
 # Network sidebar access code (generated on first use if not set via env)
 /data/network-sidebar.token
+
+# Security Lab secrets / local VM configuration
+.env
+*.pem
+*.key
+*.ppk
+*.vmem
+*.vmss

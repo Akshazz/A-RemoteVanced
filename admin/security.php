@@ -195,7 +195,7 @@ body{margin:0;background:radial-gradient(circle at 20% 5%,#15315a 0,#07101f 45%,
 </style>
 </head>
 <body>
-<header class="nav"><div class="brand">RemoteBridge · Security Center</div><a href="<?=sec_h($base.'/index.php')?>">← Back to RemoteBridge</a></header>
+<header class="nav"><div class="brand">RemoteBridge · Security Center</div><div style="display:flex;gap:12px;align-items:center"><a href="security_lab.php">Kali / VMware Lab</a><a href="<?=sec_h($base.'/index.php')?>">← Back to RemoteBridge</a></div></header>
 <main class="wrap">
 <div class="head"><div><h1>Defensive Security Center</h1><div class="muted">Integrated with your existing users, devices and audit log.</div></div><div class="muted">Admin only · safe checks</div></div>
 <div class="grid">

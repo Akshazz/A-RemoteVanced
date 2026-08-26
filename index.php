@@ -1499,6 +1499,7 @@ main{max-width:900px;margin:0 auto;width:100%}
         <?php if ($rbCurrentUser['role'] === 'admin'): ?>
         <a class="nav-dropdown-item" href="<?= htmlspecialchars($basePath . '/admin/settings.php', ENT_QUOTES) ?>">Admin settings</a>
         <a class="nav-dropdown-item" href="<?= htmlspecialchars($basePath . '/admin/security.php', ENT_QUOTES) ?>">Security Center</a>
+        <a class="nav-dropdown-item" href="<?= htmlspecialchars($basePath . '/admin/security_lab.php', ENT_QUOTES) ?>">Kali / VMware Lab</a>
         <?php endif; ?>
         <div class="nav-dropdown-divider"></div>
         <button type="button" class="nav-dropdown-item" onclick="rbLogout()">Log out</button>

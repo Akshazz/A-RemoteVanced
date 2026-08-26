@@ -119,3 +119,94 @@ review/                    Prior RBAC code-review documents (historical)
 - Keep `config.php`, `database.php`, and `agent/.token` out of version control and off the public web (already blocked by `.htaccess`).
 - Only run the control agent on machines whose owner has agreed to be remotely controlled, and only while a session is actually active.
 - The `review/` folder contains an earlier code review that flagged missing authentication/authorization; that has since been implemented (see `includes/bootstrap.php` and the `/api/admin/*`, `/api/auth/*` routes) — the review docs are kept for historical reference.
+
+
+## Kali / VMware Security Lab
+
+The project now includes an **admin-only, localhost-only Security Lab** at
+`/admin/security_lab.php`. It is designed for authorized testing and pairs
+with the existing defensive Security Center.
+
+### Features
+- VMware Workstation `vmrun` start/status/stop controls for a configured Kali VM.
+- Optional SSH execution into Kali using an SSH private key.
+- Restricted Kali operational console presets (`uname`, `ip`, routes, sockets,
+  `whoami`, and Nmap localhost validation).
+- Nmap profiles: quick, service, safe NSE, and an explicitly confirmed
+  vulnerability-lab profile.
+- Every offensive run requires a scope that was explicitly marked authorized.
+- Run history and audit-log events.
+- No general-purpose remote shell is exposed by the Security Lab UI.
+
+### Windows/XAMPP environment
+
+Set these environment variables before starting Apache/PHP:
+
+```text
+RB_SECURITY_LAB_ENABLED=1
+RB_VMWARE_VMRUN=C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe
+RB_KALI_VMX=C:\VMs\Kali-Linux\Kali-Linux.vmx
+RB_KALI_SSH_HOST=127.0.0.1
+RB_KALI_SSH_PORT=22
+RB_KALI_SSH_USER=kali
+RB_KALI_SSH_KEY=C:\Users\YOURUSER\.ssh\kali_lab
+RB_SECURITY_LAB_TIMEOUT=45
+```
+
+Use **either** SSH configuration or VMware guest credentials. SSH keys are
+preferred because passwords do not need to be placed in process arguments.
+
+If using VMware guest execution instead:
+
+```text
+RB_KALI_GUEST_USER=kali
+RB_KALI_GUEST_PASSWORD=CHANGE_ME
+```
+
+Do not commit real passwords, SSH private keys, `.env` files, or VM snapshots
+to source control.
+
+### Kali prerequisites
+
+Inside the Kali VM, install the authorized assessment tools:
+
+```bash
+sudo apt update
+sudo apt install -y nmap openssh-server
+sudo systemctl enable --now ssh
+```
+
+For the optional web assessment workflow, install Nikto separately and add
+its integration only after validating the lab network boundary.
+
+### Scope model
+
+1. Open **Security Center → Authorized scope**.
+2. Add an IP/hostname that you own or have explicit permission to assess.
+3. Tick the authorization confirmation.
+4. Open **Kali / VMware Lab**.
+5. Start the Kali VM and verify connectivity.
+6. Run a bounded Nmap profile.
+7. Review the output and defensive findings.
+
+The vulnerability-lab profile is intentionally gated behind an additional
+confirmation because vulnerability NSE scripts can be more intrusive than
+the normal defensive audit.
+
+### VMware note
+
+The application controls an existing VMware VM; it does not create or modify
+VMware virtual hardware automatically. Create/import the Kali VM in VMware
+Workstation first, then point `RB_KALI_VMX` to its `.vmx` file.
+
+### Security Lab readiness workflow
+
+After applying the database migrations, open `admin/security_lab.php` as an admin.
+The lab now exposes a readiness check that verifies the Kali guest identity,
+network configuration, Nmap availability, and SSH service before an assessment.
+It also provides target DNS resolution, bounded Nmap result parsing, run duration,
+open-port summaries, and a 100-run history table.
+
+If the lab reports that VMware or SSH is not configured, fix the environment
+variables first rather than trying to run the assessment. The application keeps
+all scan targets tied to an explicitly authorized Security Center scope.
