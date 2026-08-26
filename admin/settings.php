@@ -118,7 +118,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
       <span class="name"><?= h($currentDisplayName) ?></span>
       <span class="badge">admin</span>
     </div>
-    <a class="back" href="<?= h($base . '/index.php') ?>">← Back to RemoteBridge</a>
+    <a class="back" href="<?= h($base . '/admin/security.php') ?>">Security Center</a><a class="back" href="<?= h($base . '/index.php') ?>">← Back to RemoteBridge</a>
   </div>
 </header>
 
